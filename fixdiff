@@ -8,7 +8,7 @@
 # offset (additions - deletions accumulated so far).
 #
 # Usage:
-#   fixdiff <file>       in-place rewrite, with <file>.bak backup
+#   fixdiff <file>       in-place rewrite
 #   fixdiff              read stdin, write stdout
 #
 # Examples:
@@ -67,6 +67,6 @@ if [ $# -eq 0 ]; then
 else
   f=$1
   [ -f "$f" ] || { echo "fixdiff: no such file: $f" >&2; exit 1; }
-  cp "$f" "$f.bak"
-  awk "$awk_prog" "$f.bak" > "$f"
+  tmp=$(mktemp)
+  awk "$awk_prog" "$f" > "$tmp" && mv "$tmp" "$f"
 fi
