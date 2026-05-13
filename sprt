@@ -1,0 +1,20 @@
+#!/bin/bash
+
+e1=engine.js
+e2=engine.js
+
+elo0=0
+elo1=5
+concurrency=15
+book=UHO_Lichess_4852_v1
+
+CPUS=0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30 
+
+taskset -c $CPUS \
+~/fastchess-ob -recover -concurrency $concurrency -rounds 10000 -repeat \
+-resign movecount=5 score=600 \
+-draw movenumber=40 movecount=8 score=5 \
+-engine cmd=$e1 proto=uci tc=20+0.2 timemargin=250 name=e1 \
+-engine cmd=$e2 proto=uci tc=20+0.2 timemargin=250 name=e2 \
+-openings file=/mnt/d/books/$book.epd format=epd order=random -srand $RANDOM \
+-sprt elo0=$elo0 elo1=$elo1 alpha=0.05 beta=0.1 \
