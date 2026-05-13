@@ -18,9 +18,9 @@ Results are chronologically logged in the repo wiki:-
 
 https://github.com/op12no2/eval/wiki
 
-Results marked with ```PASS n``` passed SPRT with a very approximate gain of ```n``` Elo (SPRT Elo greater then the bound is not very accurate).
+Results marked with ```PASS n``` passed SPRT with a very approximate gain of ```n``` Elo (SPRT Elo greater than the bound is not very accurate).
 
-There is no strategy in the order that test models, so the low hanging fruit in the early tests is pure luck really. 
+There is no real strategy to the order that I test models, so which ones get the low hanging fruit early on is pure luck. 
 
 I'll plot the results when I get more data.
 
