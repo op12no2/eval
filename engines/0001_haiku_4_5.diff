@@ -63,3 +63,4 @@
    // tapered eval
    const mgScore = g_stm === WHITE ? mgW - mgB : mgB - mgW;
    const egScore = g_stm === WHITE ? egW - egB : egB - egW;
+   
