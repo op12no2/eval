@@ -1,6 +1,8 @@
 "use strict"
 
-const { uciExecLine, evaluate } = require('./engine.js');
+// usage: node eval.js [enginePath]   (default ./engine.js)
+const enginePath = require('path').resolve(process.argv[2] || './engine.js');
+const { uciExecLine, evaluate } = require(enginePath);
 
 const BENCHFENS = [
 

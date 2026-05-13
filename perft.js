@@ -1,6 +1,8 @@
 "use strict"
 
-const { position, perft } = require('./engine.js');
+// usage: node perft.js [maxDepth] [enginePath]   (default 0 / ./engine.js)
+const enginePath = require('path').resolve(process.argv[3] || './engine.js');
+const { position, perft } = require(enginePath);
 
 const PERFTFENS = [
   ['fen rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR             w KQkq -  0 1', 0, 1,         'startpos-0'],

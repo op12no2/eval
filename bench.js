@@ -1,6 +1,8 @@
 "use strict"
 
-const { uciExecLine, getNodes } = require('./engine.js');
+// usage: node bench.js [enginePath]   (default ./engine.js)
+const enginePath = require('path').resolve(process.argv[2] || './engine.js');
+const { uciExecLine, getNodes } = require(enginePath);
 
 const BENCHFENS = [
 
