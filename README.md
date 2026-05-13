@@ -10,7 +10,7 @@ Syntax errors and crashes are not corrected.
 
 The idea is that the strength will asymptote, with new model versions then making more headway.
 
-The prompt is given in a new chat window using web UIs. So really it's testing the model in a web UI context rather than just the model, as knowledge can presumably leak between chats. But as a bit of fun, that's OK.
+The prompt is given in a new chat window using web UIs. So really it's testing the model and the web UI together rather than just the model, as knowledge can presumably leak between chats. But as a bit of fun, that's OK. Some models may also have access to better testing facilities than others.
 
 The initial engine is very straight-forward and around 1800 Elo. There are 100s of Elo to be had from the changes.
 
