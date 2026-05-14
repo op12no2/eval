@@ -1,6 +1,6 @@
 #!/bin/bash
 
-e1=engines/0003_opus_4_7.js
+e1=engines/0004_gpt_5_5.js
 e2=engine.js
 
 elo0=0
