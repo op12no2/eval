@@ -9,7 +9,8 @@ called
 
 with improved playing strength.
 
-do not ask for guidance, use your intuition.
+do not ask for guidance or present options.
 
 use the tools in ./tools to test and optionally use ./bin/match to run a match.
 
+provide a short summary of what you did and why.
