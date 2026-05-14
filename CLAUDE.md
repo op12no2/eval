@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository purpose
 
-Per `README.md`, this repo is "Cumulative LLM eval using phased sandboxed areas of a chess engine, starting with the evaluation function." A chess engine acts as a substrate for evaluating LLMs: each phase opens up one well-defined region of `engine.js` for edit (currently the eval region), LLMs reply with a unified diff via a fresh web-UI chat, and any diff that passes a [0, 5] SPRT becomes the new baseline `engine.js`. Syntax errors and crashes are not corrected. Older engines accumulate under `engines/`, results write up in the GitHub wiki. The engine lives in `engine.js`; three thin Node entry points (`bench.js`, `perft.js`, `eval.js`) `require('./engine.js')` and drive the suites. There is no build, no package.json, no dependencies, and no test framework.
+Repo is `patchwork` (github.com/op12no2/patchwork). Per `README.md`, the project is "Cumulative LLM eval using phased sandboxed areas of a chess engine, starting with the evaluation function." A chess engine acts as a substrate for evaluating LLMs: each phase opens up one well-defined region of `engine.js` for edit (currently the eval region), LLMs reply with a unified diff via a fresh web-UI chat, and any diff that passes a [0, 5] SPRT becomes the new baseline `engine.js`. Syntax errors and crashes are not corrected. Older engines accumulate under `engines/`, results write up in the GitHub wiki. The engine lives in `engine.js`; three thin Node entry points (`bench.js`, `perft.js`, `eval.js`) `require('./engine.js')` and drive the suites. There is no build, no package.json, no dependencies, and no test framework.
 
 ## Running
 
@@ -84,9 +84,9 @@ All evaluation code lives inside a clearly delimited region:
 
 Anything between those banners (the `mgPST`/`egPST` arrays, the `PHASE_INC` table, `initEval`, `evaluate`, the `initEval()` call at the end of the region, and any helpers an LLM wants to add) is fair game to replace or extend. The contract is just: `evaluate()` exists and returns a centipawn score from the side-to-move perspective. The init call lives inside the region too, so the bottom-of-file init block doesn't reference eval at all — the region is self-contained and can be replaced wholesale without touching anything else.
 
-The current baseline is Tomasz Michniewski's [Simplified Evaluation Function](https://www.chessprogramming.org/Simplified_Evaluation_Function). Two PSTs (`mgPST`, `egPST`), each `15 * 128` Int16, are built once by `initEval`. The MG and EG tables are deliberately *identical for every piece except the king*, which has separate middle- and end-game tables — so the tapered framework is in place but only the king's positioning shifts as material comes off.
+The original baseline was Tomasz Michniewski's [Simplified Evaluation Function](https://www.chessprogramming.org/Simplified_Evaluation_Function) — PST + material only, MG and EG tables identical for every piece except the king. Successive accepted patches have grown the region considerably (see the GitHub wiki for the per-run history). Read the current state of the eval region rather than relying on this paragraph — terms may include pawn structure (doubled, isolated, passed with mg/eg curves), rook open/semi-open file, bishop pair, knight/bishop mobility, king pawn shield, tempo, and others that LLMs have added or refined since.
 
-`evaluate` is a single board scan that branches on the colour bit, accumulating `mg`/`eg` for white and black plus a `phase` total from `PHASE_INC` (knight/bishop=1, rook=2, queen=4, clamped to 24). There is currently **no** evaluation beyond material+PST (no pawn structure, mobility, king safety, bishop pair, etc.) — these are natural extensions for the LLM-edit workflow.
+Two PSTs (`mgPST`, `egPST`), each `15 * 128` Int16, are built once by `initEval`. `evaluate` is a single board scan that branches on the colour bit, accumulating `mg`/`eg` for white and black plus a `phase` total from `PHASE_INC` (knight/bishop=1, rook=2, queen=4, clamped to 24), then folds in any additional terms and returns the tapered result from the side-to-move perspective.
 
 ### Initialisation order
 
@@ -94,13 +94,14 @@ At the bottom of `engine.js`: `initNodes`, `initZobrist`, `initQpth` run uncondi
 
 ### Procedure
 
-- save chat ui result to e.g. `engines/0001_gpt_5_5.diff`
-- apply diff using e.g. `patch -p1 -o engines/0001_gpt_5_5.js engine.js < engines/0001_gpt_5_5.diff`
+- save chat ui result to e.g. `engines/0004_gpt_5_5.diff`
+- normalise hunk headers with `./fixdiff engines/0004_gpt_5_5.diff` (LLM-generated diffs frequently have wrong line counts; this rewrites them in place)
+- apply diff using e.g. `patch -p1 -o engines/0004_gpt_5_5.js engine.js < engines/0004_gpt_5_5.diff`
 - `chmod +x engines/*.js`
 - add the engine and diff to the repo e.g. `git add engines/*.js && git add engines/*.diff`
-- test
-- SPRT
-- if it passes `cp engines/0001_gpt_5_5.js engine.js`
-- add a wiki page called `0001_gpt_5_5` with the experiment results
+- smoke-test via `node bench.js engines/0004_gpt_5_5.js` and `node perft.js 3 engines/0004_gpt_5_5.js`
+- run SPRT (see the `sprt` script)
+- if it passes `cp engines/0004_gpt_5_5.js engine.js`
+- add a wiki page called `0004_gpt_5_5` (or `_PASS_NN` / `_FAIL` suffix per convention) with the experiment results
 - commit and push
 
