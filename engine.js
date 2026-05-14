@@ -2149,8 +2149,8 @@ function uciExecLine(line) {
     }
 
     case 'uci': {
-      console.log('id name Naddu 1');
-      console.log('id author op12no2');
+      console.log('id name Patchwork 1');
+      console.log('id author Colin Jenkins');
       console.log('uciok');
       break;
     }
