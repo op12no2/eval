@@ -4,13 +4,13 @@ using the current best chess engine
 
 as your starting point, create a new engine in
 
-./engines/0004_gpt_5_5.js 
+./engines/0005_opus_4_7.js 
 
 with improved playing strength.
 
 your goal is to become the new best engine.
 
-do not ask for guidance or present options.
+do not ask questions or present options.
 
 you have carte blanche to delete/edit/fix/add any of the code as needed, regardless of previous authorship.
 
