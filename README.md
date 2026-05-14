@@ -17,7 +17,6 @@ Models are given the chance to improve the currently leading engine to become th
 
 ```mermaid
 xychart-beta
-  title "Summary"
   x-axis "Engine #" [0, 1, 2, 3, 4, 5]
   y-axis "Relative Elo" 0 --> 200
   bar [0, 0, 135, 130, 0, 30]
