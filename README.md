@@ -14,3 +14,11 @@ An informal cumulative and comptitive frontier LLM eval using a Javascript chess
 See the ```engines``` dir for each engine source.
 
 Models are given the chance to improve the currently leading engine to become the new leader using ```prompt.md```. The resultant engine is then evaluated by a [0,5] SPRT against the leading engine. 
+
+```mermaid
+xychart-beta
+  title "Cumulative Elo"
+  x-axis "Engine #" [0, 1, 2, 3, 4, 5]
+  y-axis "Relative Elo" 0 --> 300
+  line [0, 0, 135, 265, 265, 295]
+```
