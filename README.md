@@ -1,6 +1,6 @@
 # Patchwork
 
-A cumulative LLM eval using phased sandboxed areas of a chess engine, starting with the evaluation function.
+An informal cumulative LLM eval using phased sandboxed areas of a chess engine, starting with the evaluation function.
 
 Models are given the phase-dependent prompt in ```prompt.md``` and the current chess engine code ```engine.js```. If the new code passes a [0,5] SPRT it becomes ```engine.js```. 
 
