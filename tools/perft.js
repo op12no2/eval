@@ -3,6 +3,7 @@
 // usage: node perft.js engine
 // e.g. node perft.js 0000_original
 // performs a PERFT over several positions showing a cumulative node count and nps.
+// takes a few seconds to run.
 // PERFT errors are logged.
 
 const enginePath = require('path').resolve('./engines/' + process.argv[2] + '.js');

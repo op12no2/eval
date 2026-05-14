@@ -3,6 +3,7 @@
 // usage: node eval.js engine
 // e.g. node eval.js 0000_original
 // performs an evaluation over several positions also showing a cumulative eval.
+// this is a very quick test
 
 const enginePath = require('path').resolve('./engines/' + process.argv[2] + '.js');
 console.log(enginePath);

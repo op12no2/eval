@@ -9,7 +9,7 @@ e1=engines/$1.js
 e2=engines/$2.js
 
 concurrency=15
-book=UHO_Lichess_4852_v1
+book=4moves_noob
 
 e1name=${e1##*/}
 e1name=${e1name%.js}
