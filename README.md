@@ -43,7 +43,7 @@ See ```bin/tourny```.
 
 ### Notes
 
-- There are Windows executables in ```./engines``` for anybody that is interested.
+- There is a Windows executable for each engine in ```./engines``` for anybody that is interested.
 
 ### Acknowledgements
 
