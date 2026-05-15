@@ -19,4 +19,4 @@ If anybody out there has the inclination to test the engines, they are easily co
 bun build engine.js --compile --target=bun-windows-x64-modern --outfile engine.exe
 ```
 
-The boot engine was around 1800 Elo. The Elo column is only a rough estimate; passing the SPRT is the important thing.
+The boot engine was around 1800 Elo. The Elo column is a very rough estimate; passing the SPRT is the important thing.
