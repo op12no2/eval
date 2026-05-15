@@ -27,3 +27,11 @@ use the tools in ./tools and your engine natively (via node) to test. temporaril
 you can use ./bin/match to run a match between your engine and the current best engine (you'll need to chmod +x your engine). see match.pgn for the games.
 
 validate each candidate change with matches of several hundred games minimum — shorter runs are noise and will mislead you about whether a change is a real gain.
+
+other resources:-
+
+/mnt/d/engines/sf - stockfish
+/mnt/d/hcetraining/*.epd - data suitable for any evaluation function tuner/trainer you write
+../datagen/*.vf - viriformat data suitable for network training
+../bullet - bullet network trainer
+
