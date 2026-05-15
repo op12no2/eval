@@ -1,6 +1,6 @@
 ## Patchwork
 
-An informal cumulative and comptitive frontier LLM eval using a Javascript chess engine.
+An informal cumulative and comptitive frontier model eval using a Javascript chess engine.
 
 | Engine                                                                          | Model                       | CLI         | SPRT | ~Elo | Notes                | 
 |---------------------------------------------------------------------------------|-----------------------------|-------------|------|------|----------------------| 
