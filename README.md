@@ -15,7 +15,7 @@ An informal cumulative and comptitive frontier model eval using a Javascript che
  
 ### Procedure 
 
-Assume ```A``` is the current best engine (initially ````0000_original````). A model/CLI is selected to improve it by creating a new engine ```B``` using ```prompt.md```. If  a ```B``` v ```A``` SPRT passes, ```B``` becomes the new best engine. So for example ```0002_sonnet_4_6``` was derived from ```0000_original```, not ```0001_haiku_4_5```.   
+Assume ```A``` is the current best engine (initially ````0000_original````). A model/CLI is selected to improve it by creating a new engine ```B``` via ```prompt.md```. If a ```B``` v ```A``` SPRT passes, ```B``` becomes the new best engine. So for example ```0002_sonnet_4_6``` was derived from ```0000_original```, not ```0001_haiku_4_5```.   
 
 ```
     /---> 0001          /---> 0004
@@ -37,7 +37,7 @@ See ```bin/sprt```.
 | 7 | 0000_original | 1800 ±18.23 | 1400 | 27.2% | 27.6% |
 | 8 | 0001_haiku_4_5 | 1771 ±19.14 | 1400 | 24.1% | 23.4% |
 
-See ```bin/tourny``` for the spec.
+See ```bin/tourny```.
 
 ### Notes
 
