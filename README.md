@@ -20,7 +20,6 @@ Assume ```A``` is the current best engine (initially ````0000_original````). A m
 ```
     /---> 0001          /---> 0004
 0000 ---> 0002 ---> 0003 ---> 0005 ---> 0006 etc.
-   
 ```
 
 See ```bin/sprt```.
