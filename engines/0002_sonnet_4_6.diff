@@ -1,0 +1,598 @@
+--- engines/0000_original.js	2026-05-14 11:38:43.371985831 +0100
++++ engines/0002_sonnet_4_6.js	2026-05-14 14:35:06.352106630 +0100
+@@ -15,6 +15,10 @@
+ // → make / unmake → move generation → move ordering → perft → time control →
+ // evaluation → search / qsearch → UCI driver → bottom-of-file init.
+ //
++// [Sonnet 4.6] Engine: 0002_Sonnet_4_6 — aspiration windows, 2 killers,
++// countermove table, enhanced eval (pawn structure + bishop pair + rook files),
++// LMR skip captures/promotions.
++//
+ 
+ const INF = 31000;
+ const MATE = 30000;
+@@ -319,6 +323,10 @@
+   this.undoLoHash = 0;
+   this.undoHiHash = 0;
+   this.undoHmClock = 0;
++  // [Sonnet 4.6] 2 killers per ply + move made to reach this ply (for countermove lookup)
++  this.killer1 = 0;
++  this.killer2 = 0;
++  this.move = 0;
+ 
+ }
+ 
+@@ -1255,13 +1263,18 @@
+ // cutoff by a quiet move, that move gets `+depth*depth` and the earlier
+ // quiet moves that didn't cut off get `-depth*depth` via updateQpth.
+ //
+-// There is no separate killer-move table — quiet ordering rides entirely on
+-// this history. clearQpth runs at the start of each `go` so scores do not
+-// persist across UCI search invocations.
++// clearQpth runs at the start of each `go` so scores do not persist across
++// UCI search invocations.
++//
++// [Sonnet 4.6] Added g_countermove table: 15×128 Uint32Array indexed by
++// [prevPiece][prevToSq] storing the best response move (countermove heuristic).
+ //
+ 
+ const g_qpth = Array(15); // quiet piece to history
+ 
++// [Sonnet 4.6] Countermove table: g_countermove[piece][toSq] = bestResponseMove
++const g_countermove = Array(15);
++
+ function updateQpth(move, bonus) {
+ 
+   const to = move & 0x7F;
+@@ -1275,7 +1288,9 @@
+ function initQpth () {
+ 
+     for (let i=0; i < 15; i++) {
+-      g_qpth[i] = new Int32Array(128)
++      g_qpth[i] = new Int32Array(128);
++      // [Sonnet 4.6] Init countermove table alongside history
++      g_countermove[i] = new Uint32Array(128);
+     }
+ 
+ }
+@@ -1284,6 +1299,15 @@
+ 
+     for (let i=0; i < 15; i++) {
+       g_qpth[i].fill(0);
++      // [Sonnet 4.6] Clear countermove table on each new search
++      g_countermove[i].fill(0);
++    }
++
++    // [Sonnet 4.6] Clear per-ply killer and move fields on each new search
++    for (let i=0; i < MAX_PLY; i++) {
++      g_ss[i].killer1 = 0;
++      g_ss[i].killer2 = 0;
++      g_ss[i].move = 0;
+     }
+ 
+ }
+@@ -1333,21 +1357,35 @@
+ 
+ }
+ 
+-function rankQuiets(node) {
++// [Sonnet 4.6] rankQuiets now accepts ply to access killer1, killer2, and countermove
++function rankQuiets(node, ply) {
+ 
+   const b = g_board;
+   const moves = node.moves;
+   const ranks = node.ranks;
+   const n = node.numMoves;
++  const nd = g_ss[ply];
++  const k1 = nd.killer1;
++  const k2 = nd.killer2;
++  // [Sonnet 4.6] Look up countermove: what move beat the opponent's last move
++  let cm = 0;
++  const prevMove = nd.move;
++  if (prevMove) {
++    const prevPiece = b[prevMove & 0x7F];
++    if (prevPiece) cm = g_countermove[prevPiece][prevMove & 0x7F];
++  }
+ 
+-  for (let i=0; i < n; i++) {
++  for (let i = 0; i < n; i++) {
+ 
+     const m = moves[i];
+-    const fr = (m >> 7) & 0x7F;
+-    const to = m & 0x7F;
+-    const piece = b[fr];
+-
+-    ranks[i] = g_qpth[piece][to];
++    // [Sonnet 4.6] Order: killer1 > killer2 > countermove > history
++    if (m === k1) ranks[i] = 900000;
++    else if (m === k2) ranks[i] = 800000;
++    else if (m === cm) ranks[i] = 700000;
++    else {
++      const piece = b[(m >> 7) & 0x7F];
++      ranks[i] = g_qpth[piece][m & 0x7F];
++    }
+ 
+     if (m & MOVE_FLAG_NOISY)
+       console.log('NOISY MOVE IN QUIET LIST');
+@@ -1369,7 +1407,7 @@
+ 
+     if (!(m & MOVE_FLAG_NOISY))
+       console.log('QUIET MOVE IN NOISY LIST');
+-  
++
+     let rank = 0;
+ 
+     if (m & MOVE_FLAG_PROMOTE) {
+@@ -1404,8 +1442,8 @@
+ //      through to stage 2
+ //   2  drain best-ranked noisy move; with noisyOnly=1 (qsearch outside
+ //      check) stop here
+-//   3  generate quiet moves and castling, rank quiets by g_qpth history,
+-//      fall through to stage 4
++//   3  generate quiet moves and castling, rank quiets by killer/countermove/
++//      g_qpth history, fall through to stage 4
+ //   4  drain best-ranked quiet move
+ // The case fall-throughs are deliberate — stages 1 and 3 set up the list
+ // and immediately serve the first move from it.
+@@ -1414,8 +1452,10 @@
+ // call. removeTTMove deduplicates the TT move out of the freshly generated
+ // list since stage 0 already returned it.
+ //
++// [Sonnet 4.6] getNextMove now takes ply parameter for killer/countermove ordering
++//
+ 
+-function getNextMove(node) {
++function getNextMove(node, ply) {
+ 
+   switch (node.stage) {
+ 
+@@ -1464,7 +1504,8 @@
+         genCastling(node);
+       if (node.ttMove && !(node.ttMove & MOVE_FLAG_NOISY))
+         removeTTMove(node);
+-      rankQuiets(node);
++      // [Sonnet 4.6] Pass ply for killer/countermove ordering
++      rankQuiets(node, ply);
+ 
+     }
+ 
+@@ -1499,7 +1540,8 @@
+ 
+   initSearch(node, inCheck, 0, 0);
+ 
+-  while ((move = getNextMove(node))) {
++  // [Sonnet 4.6] Pass ply to getNextMove (perft exercises the full move iterator)
++  while ((move = getNextMove(node, ply))) {
+ 
+     make(node, move);
+     if (!isAttacked(g_kingSq[stm], nstm))
+@@ -1527,10 +1569,10 @@
+ 
+     if (g_finishTime && now() >= g_finishTime)
+       g_finished = 1;
+-    
++
+     if (g_maxNodes && g_nodes >= g_maxNodes)
+       g_finished = 1;
+-      
++
+ }
+ 
+ function initTimeControl(tokens) {
+@@ -1615,6 +1657,7 @@
+   g_finishTime = g_startTime + ms;
+ 
+ }
++
+ //
+ // Evaluation. evaluate() returns a centipawn score from the side-to-move
+ // perspective (positive = side to move is winning). It walks g_board once,
+@@ -1629,7 +1672,9 @@
+ //
+ // The baseline is Tomasz Michniewski's Simplified Evaluation Function: PST
+ // + material, with mg/eg tables identical for every piece except the king.
+-// There are no pawn-structure, mobility, or king-safety terms.
++//
++// [Sonnet 4.6] Enhanced evaluate() with pawn structure (isolated, doubled,
++// passed), bishop pair bonus, and rook open/semi-open file bonuses.
+ //
+ 
+ const mgPST = new Int16Array(15 * 128);
+@@ -1741,27 +1786,113 @@
+   }
+ }
+ 
++// [Sonnet 4.6] Module-level eval working arrays to avoid per-call allocation
++const _evalWPF = new Uint8Array(8);  // white pawn counts per file
++const _evalBPF = new Uint8Array(8);  // black pawn counts per file
++
++initEval();
++
++// [Sonnet 4.6] Passed pawn bonuses by rank (0x88 rank index 0..7)
++// rank 0 = rank 1 (white's back rank), rank 7 = rank 8
++// White pawn on rank r uses PASSED_MG[r]; rank 6 = 7th rank = large bonus
++// Black pawn on rank r uses PASSED_MG[7-r]; rank 1 = 7th rank = large bonus
++const PASSED_MG = new Int16Array([0, 5, 10, 20, 35, 55, 80, 0]);
++const PASSED_EG = new Int16Array([0, 10, 20, 40, 65, 95, 130, 0]);
++
++// [Sonnet 4.6] Enhanced evaluate() with pawn structure, bishop pair, rook files
+ function evaluate() {
+ 
+   const b = g_board;
+-
+   let mgW = 0, mgB = 0, egW = 0, egB = 0;
+   let phase = 0;
+ 
++  _evalWPF.fill(0);
++  _evalBPF.fill(0);
++  // [Sonnet 4.6] Track bishop counts and rook file masks for structural bonuses
++  let wBishops = 0, bBishops = 0;
++  let wRookMask = 0, bRookMask = 0;
++
++  // First pass: material+PST, collect pawn file counts, bishop/rook info
+   for (let sq = 0; sq < 128; sq++) {
+     if (sq & 0x88) { sq += 7; continue; }
+     const piece = b[sq];
+     if (!piece) continue;
++    const type = piece & 7;
++    const file = sq & 7;
+     const idx = piece * 128 + sq;
++
+     if (piece & BLACK) {
+       mgB += mgPST[idx];
+       egB += egPST[idx];
+-    }
+-    else {
++      if (type === PAWN)        _evalBPF[file]++;
++      else if (type === BISHOP) bBishops++;
++      else if (type === ROOK)   bRookMask |= (1 << file);
++    } else {
+       mgW += mgPST[idx];
+       egW += egPST[idx];
++      if (type === PAWN)        _evalWPF[file]++;
++      else if (type === BISHOP) wBishops++;
++      else if (type === ROOK)   wRookMask |= (1 << file);
++    }
++    phase += PHASE_INC[type];
++  }
++
++  // [Sonnet 4.6] Bishop pair bonus (stronger in endgame)
++  if (wBishops >= 2) { mgW += 30; egW += 50; }
++  if (bBishops >= 2) { mgB += 30; egB += 50; }
++
++  // [Sonnet 4.6] Rook on open or semi-open file bonus
++  for (let f = 0; f < 8; f++) {
++    if ((wRookMask >> f) & 1) {
++      if (!_evalWPF[f] && !_evalBPF[f]) { mgW += 20; egW += 20; }  // fully open
++      else if (!_evalWPF[f])             { mgW += 10; egW += 10; }  // semi-open
++    }
++    if ((bRookMask >> f) & 1) {
++      if (!_evalWPF[f] && !_evalBPF[f]) { mgB += 20; egB += 20; }  // fully open
++      else if (!_evalBPF[f])             { mgB += 10; egB += 10; }  // semi-open
++    }
++  }
++
++  // [Sonnet 4.6] Second pass: pawn structure (isolated, doubled, passed)
++  for (let sq = 0; sq < 128; sq++) {
++    if (sq & 0x88) { sq += 7; continue; }
++    const piece = b[sq];
++    if (!piece || (piece & 7) !== PAWN) continue;
++
++    const file = sq & 7;
++    const rank = sq >> 4;
++
++    if (!(piece & BLACK)) {
++      // White pawn
++      if (_evalWPF[file] > 1)                          { mgW -= 10; egW -= 15; }  // doubled
++      const adjL = file > 0 ? _evalWPF[file - 1] : 0;
++      const adjR = file < 7 ? _evalWPF[file + 1] : 0;
++      if (!adjL && !adjR)                              { mgW -= 15; egW -= 20; }  // isolated
++      // Passed pawn: no black pawn on same or adjacent files strictly ahead
++      let passed = true;
++      outer: for (let f2 = (file > 0 ? file - 1 : 0); f2 <= (file < 7 ? file + 1 : 7); f2++) {
++        if (_evalBPF[f2] === 0) continue;
++        for (let r2 = rank + 1; r2 <= 7; r2++) {
++          if (b[r2 * 16 + f2] === BPAWN) { passed = false; break outer; }
++        }
++      }
++      if (passed) { mgW += PASSED_MG[rank]; egW += PASSED_EG[rank]; }
++    } else {
++      // Black pawn
++      if (_evalBPF[file] > 1)                          { mgB -= 10; egB -= 15; }  // doubled
++      const adjL = file > 0 ? _evalBPF[file - 1] : 0;
++      const adjR = file < 7 ? _evalBPF[file + 1] : 0;
++      if (!adjL && !adjR)                              { mgB -= 15; egB -= 20; }  // isolated
++      // Passed pawn: no white pawn on same or adjacent files strictly ahead (lower ranks)
++      let passed = true;
++      outer: for (let f2 = (file > 0 ? file - 1 : 0); f2 <= (file < 7 ? file + 1 : 7); f2++) {
++        if (_evalWPF[f2] === 0) continue;
++        for (let r2 = rank - 1; r2 >= 0; r2--) {
++          if (b[r2 * 16 + f2] === WPAWN) { passed = false; break outer; }
++        }
++      }
++      if (passed) { mgB += PASSED_MG[7 - rank]; egB += PASSED_EG[7 - rank]; }
+     }
+-    phase += PHASE_INC[piece & 7];
+   }
+ 
+   // tapered eval
+@@ -1774,8 +1905,6 @@
+   return (mgScore * mgPhase + egScore * egPhase) / 24 | 0;
+ }
+ 
+-initEval();
+-
+ function collectPV(node, cNode, move) {
+ 
+   if (cNode) {
+@@ -1807,10 +1936,11 @@
+ }
+ 
+ //
+-// Search. Negamax with PVS (principal variation search). go() drives plain
+-// iterative deepening — search(0, depth, -INF, INF) per depth, no aspiration
+-// windows. search recurses into itself for non-leaf nodes and into qsearch
+-// when depth <= 0.
++// Search. Negamax with PVS (principal variation search). go() drives
++// iterative deepening with aspiration windows (depth >= 5) starting at ±25cp,
++// growing ×1.5 on failure, falling back to full window after delta > 800.
++// search recurses into itself for non-leaf nodes and into qsearch when
++// depth <= 0.
+ //
+ // Pruning and reduction features (the gating conditions are load-bearing —
+ // the !isPV && !inCheck && score-against-MATEISH guards keep mate scores
+@@ -1821,12 +1951,15 @@
+ //   - Mate distance pruning.
+ //   - Static beta pruning, null-move pruning (R=3), late-move pruning,
+ //     futility pruning — all !isPV && !inCheck, score-bounded.
+-//   - Late move reductions, inline:
++//   - Late move reductions, inline (never applied to captures/promotions):
+ //       R = floor(0.75 + log(depth) * log(played) / 2.25)
+ //       then -inCheck, -isPV, clamped to depth - 2.
+ //   - IID-ish PV reduction when no TT move: depth>5 && isPV && !ttMove → d--.
+-//   - Quiet history bonus/malus on beta cutoff (via updateQpth). No separate
+-//     killer-move table.
++//   - 2 killers per ply + countermove table for quiet move ordering.
++//   - Quiet history bonus/malus on beta cutoff (via updateQpth).
++//
++// [Sonnet 4.6] Added aspiration windows, 2 killers, countermove updates,
++// LMR guard for captures/promotions.
+ //
+ 
+ function search(ply, depth, alpha, beta) {
+@@ -1844,11 +1977,11 @@
+   if (ply >= MAX_PLY)
+     return evaluate();
+ 
+-  const node = g_ss[ply]; 
++  const node = g_ss[ply];
+   const cNode = ply <= MAX_PLY - 2 ? g_ss[ply + 1] : 0;
+-  
++
+   node.pvLen = 0;
+-  
++
+   // mate distance pruning
+   const matingScore = MATE - ply;
+   if (matingScore < beta) {
+@@ -1871,7 +2004,7 @@
+ 
+   const isPV = beta !== (alpha + 1);
+   const ttix = ttGet();
+-  
++
+   if (!isPV && ttix >= 0 && g_ttDepth[ttix] >= depth) {
+     const type = g_ttType[ttix] & TT_TYPE_MASK;
+     const score = getAdjustedScore(ply, g_ttScore[ttix]);
+@@ -1896,20 +2029,20 @@
+   let bestMove = 0;
+   let bestScore = -INF;
+   let score = 0;
+-  
++
+   // beta pruning
+   if (!isPV && !inCheck && beta < MATEISH && depth <= 8 && (ev - depth * 100) >= beta)
+     return ev;
+ 
+   // null move pruning
+   if (!isPV && !inCheck && beta < MATEISH && depth > 2 && ev > beta) {
+-  
++
+     const R = 3;
+-  
++
+     make_null(node);
+     score = -search(ply+1, depth-R-1, -beta, -beta+1);
+     unmake_null(node);
+-  
++
+     if (g_finished)
+       return 0;
+ 
+@@ -1918,12 +2051,12 @@
+         score = beta;
+       return score;
+     }
+-  
++
+   }
+ 
+   initSearch(node, inCheck, ttMove, 0);
+ 
+-  while ((move = getNextMove(node))) {
++  while ((move = getNextMove(node, ply))) {
+ 
+     const noisy = move & MOVE_FLAG_NOISY;
+ 
+@@ -1941,15 +2074,18 @@
+       continue;
+     }
+ 
++    // [Sonnet 4.6] Set move field on child ply for countermove lookup
++    if (ply + 1 < MAX_PLY) g_ss[ply + 1].move = move;
++
+     playedMoves[played++] = move;
+ 
+-    // late move reductions
++    // [Sonnet 4.6] LMR: never reduce captures or promotions (!noisy guard)
+     let R = 0;
+-    if (depth >= 3 && played > 3) {
++    if (!noisy && depth >= 3 && played > 3) {
+       R = Math.floor(0.75 + Math.log(depth) * Math.log(played) / 2.25);
++      if (isPV) R -= 1;
+       R -= inCheck;
+-      if (isPV)
+-        R -= 1;
++      if (R < 0) R = 0;
+       if (R > depth - 2)
+         R = depth - 2;
+     }
+@@ -1962,7 +2098,7 @@
+         score = -search(ply + 1, depth - 1 - R, -alpha - 1, -alpha);
+         if (!g_finished && score > alpha)
+           score = -search(ply + 1, depth - 1, -beta, -alpha);
+-      }  
++      }
+     }
+     else {
+       score = -search(ply + 1, depth - 1 - R, -beta, -alpha);
+@@ -1982,21 +2118,31 @@
+         alpha = bestScore;
+         if (isPV) {
+           collectPV(node, cNode, bestMove);
+-        }  
++        }
+         if (bestScore >= beta) {
+           if (!(bestMove & MOVE_FLAG_NOISY)) {
+             const bonus = depth * depth;
+             updateQpth(bestMove, bonus);
++            // [Sonnet 4.6] 2 killers: shift killer2 = killer1, killer1 = bestMove
++            const nd = g_ss[ply];
++            if (bestMove !== nd.killer1) {
++              nd.killer2 = nd.killer1;
++              nd.killer1 = bestMove;
++            }
++            // [Sonnet 4.6] Countermove: store bestMove as response to the previous move
++            const prevMoveNd = nd.move;
++            if (prevMoveNd) {
++              const prevPiece = g_board[prevMoveNd & 0x7F];
++              if (prevPiece) g_countermove[prevPiece][prevMoveNd & 0x7F] = bestMove;
++            }
+             for (let i = 0; i < played - 1; i++) {
+               const pm = playedMoves[i];
+-              if (!(pm & MOVE_FLAG_NOISY)) {
+-                updateQpth(playedMoves[i], -bonus);
+-              }  
+-            }  
+-          }  
++              if (!(pm & MOVE_FLAG_NOISY)) updateQpth(pm, -bonus);
++            }
++          }
+           ttPut(TT_BETA, depth, putAdjustedScore(ply, bestScore), bestMove, ev, inCheck);
+           return bestScore;
+-        }  
++        }
+       }
+     }
+   }
+@@ -2035,7 +2181,7 @@
+   if (ply >= MAX_PLY)
+     return evaluate();
+ 
+-  const node = g_ss[ply]; 
++  const node = g_ss[ply];
+   node.pvLen = 0;
+ 
+   if (isDraw()) {
+@@ -2076,7 +2222,8 @@
+ 
+   initSearch(node, inCheck, ttMove, inCheck ^ 1);
+ 
+-  while ((move = getNextMove(node))) {
++  // [Sonnet 4.6] Pass ply to getNextMove for consistency (qsearch uses noisyOnly so killers/countermove not relevant)
++  while ((move = getNextMove(node, ply))) {
+ 
+     // delta pruning
+ 
+@@ -2124,22 +2271,57 @@
+ 
+ }
+ 
++// [Sonnet 4.6] go() uses aspiration windows at depth >= 5 starting at ±25cp,
++// growing ×1.5 on each failure, falling back to full window after delta > 800.
+ function go() {
+ 
+   clearQpth();
+ 
+-  let bm = 0; // best move from last completed iteration
++  let bm = 0;
++  let prevScore = 0;
++
++  for (let depth = 1; depth <= g_maxDepth && !g_finished; depth++) {
++    let score;
++
++    if (depth <= 4) {
++      // [Sonnet 4.6] Full window for shallow depths — aspiration unreliable here
++      score = search(0, depth, -INF, INF);
++    } else {
++      // [Sonnet 4.6] Aspiration windows starting at ±25cp, widening on failure
++      let delta = 25;
++      let lo = Math.max(-INF, prevScore - delta);
++      let hi = Math.min(INF, prevScore + delta);
++
++      for (;;) {
++        score = search(0, depth, lo, hi);
++        if (g_finished) break;
++        if (score <= lo) {
++          lo -= delta;
++          if (lo < -INF) lo = -INF;
++          delta = delta + (delta >> 1);
++        } else if (score >= hi) {
++          hi += delta;
++          if (hi > INF) hi = INF;
++          delta = delta + (delta >> 1);
++        } else {
++          break;
++        }
++        if (delta > 800) {
++          // [Sonnet 4.6] Fallback to full window when aspiration fails badly
++          score = search(0, depth, -INF, INF);
++          break;
++        }
++      }
++    }
+ 
+-  for (let depth = 1; depth <= g_maxDepth; depth++) {
+-    const score = search(0, depth, -INF, INF);
+     if (g_finished) break;
+-    bm = rootNode.pv[rootNode.pvLen - 1];
++    prevScore = score;
++    const rootBm = rootNode.pvLen > 0 ? rootNode.pv[rootNode.pvLen - 1] : 0;
++    if (rootBm) bm = rootBm;
+     report(score, depth);
+   }
+ 
+-  if (!bm)
+-    console.log('NO BEST MOVE');
+-
++  if (!bm) console.log('NO BEST MOVE');
+   console.log('bestmove ' + formatMove(bm));
+ 
+ }
+@@ -2170,8 +2352,9 @@
+     }
+ 
+     case 'uci': {
+-      console.log('id name Patchwork');
+-      console.log('id author Colin Jenkins');
++      // [Sonnet 4.6] Updated engine identity
++      console.log('id name Patchwork 0002_Sonnet_4_6');
++      console.log('id author Claude Sonnet 4.6');
+       console.log('uciok');
+       break;
+     }
+@@ -2252,4 +2435,3 @@
+   });
+ 
+ }
+-

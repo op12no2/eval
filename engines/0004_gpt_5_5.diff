@@ -1,0 +1,92 @@
+--- engines/0003_opus_4_7.js	2026-05-14 15:45:17.355782105 +0100
++++ engines/0004_gpt_5_5.js	2026-05-14 16:24:48.956747384 +0100
+@@ -66,6 +66,17 @@
+ // attack detection, draw rules) is unchanged from 0002 so perft results
+ // match exactly.
+ //
++// [GPT-5.5] Engine: 0004_GPT_5_5 — started from 0003_Opus_4_7 and keeps its
++// correctness-critical board core intact. Strength changes in this file are
++// tagged "[GPT-5.5]" and focus on safer table retention and preserving
++// forcing checks during late-move reductions:
++//
++//   Search:
++//     * Depth-preferred TT replacement so a shallow collision does not evict
++//       a useful deeper entry.
++//     * Check-aware LMR: legal quiet moves that give check are reduced one ply
++//       less, preserving forcing checks without changing move legality.
++//
+ 
+ const INF = 31000;
+ const MATE = 30000;
+@@ -286,6 +297,17 @@
+ 
+   const idx = g_loHash & TT_MASK;
+ 
++  // [GPT-5.5] Depth-preferred replacement. 0003 always overwrote the indexed
++  // slot, which is simple but lets a shallow leaf collision erase a much more
++  // valuable deep entry from the current game. Keep an unrelated entry when it
++  // is at least three plies deeper than the value we are about to store. Exact
++  // same-position updates still replace normally so newer bounds and moves for
++  // this hash are not stranded.
++  if (g_ttType[idx] && (g_ttLoHash[idx] !== g_loHash || g_ttHiHash[idx] !== g_hiHash)) {
++    if (g_ttDepth[idx] >= depth + 3)
++      return;
++  }
++
+   g_ttLoHash[idx] = g_loHash;
+   g_ttHiHash[idx] = g_hiHash;
+   g_ttType[idx] = inCheck ? type | TT_INCHECK : type;
+@@ -2676,6 +2698,12 @@
+       if (isPV) R -= 1;
+       if (!improving) R += 1;
+       R -= inCheck;
++      // [GPT-5.5] Check-aware LMR. 0003 reduced late quiet checking moves like
++      // ordinary quiets. A legal move that gives check is forcing, so reduce it
++      // one ply less, but only pay the attack-test cost in the LMR-eligible
++      // branch where the information is actually used.
++      const givesCheck = isAttacked(g_kingSq[nstm], stm);
++      if (givesCheck) R -= 1;
+       // [Opus 4.7] History-based small adjustment: highly-rated quiets get
+       // reduced less, poorly-rated more. The piece is at `to` post-make
+       // (g_board[fr] is empty here, which was wrong in an earlier draft).
+@@ -2689,20 +2717,22 @@
+         R = depth - 2;
+     }
+ 
++    const childDepth = depth - 1;
++
+     if (isPV) {
+       if (played === 1) {
+-        score = -search(ply + 1, depth - 1, -beta, -alpha);
++        score = -search(ply + 1, childDepth, -beta, -alpha);
+       }
+       else {
+-        score = -search(ply + 1, depth - 1 - R, -alpha - 1, -alpha);
++        score = -search(ply + 1, childDepth - R, -alpha - 1, -alpha);
+         if (!g_finished && score > alpha)
+-          score = -search(ply + 1, depth - 1, -beta, -alpha);
++          score = -search(ply + 1, childDepth, -beta, -alpha);
+       }
+     }
+     else {
+-      score = -search(ply + 1, depth - 1 - R, -beta, -alpha);
++      score = -search(ply + 1, childDepth - R, -beta, -alpha);
+       if (!g_finished && score > alpha)
+-        score = -search(ply + 1, depth - 1, -beta, -alpha);
++        score = -search(ply + 1, childDepth, -beta, -alpha);
+     }
+ 
+     if (g_finished)
+@@ -2966,9 +2996,9 @@
+     }
+ 
+     case 'uci': {
+-      // [Opus 4.7] Updated engine identity
+-      console.log('id name Patchwork 0003_Opus_4_7');
+-      console.log('id author Claude Opus 4.7');
++      // [GPT-5.5] Updated engine identity for the new contender.
++      console.log('id name Patchwork 0004_GPT_5_5');
++      console.log('id author GPT-5.5');
+       console.log('uciok');
+       break;
+     }

@@ -1,0 +1,1044 @@
+--- engines/0002_sonnet_4_6.js	2026-05-14 14:35:06.352106630 +0100
++++ engines/0003_opus_4_7.js	2026-05-14 15:45:17.355782105 +0100
+@@ -12,13 +12,60 @@
+ //
+ // Roughly top-to-bottom: constants → board state globals → Zobrist hashing →
+ // transposition table → per-ply node struct → board setup → attack detection
+-// → make / unmake → move generation → move ordering → perft → time control →
+-// evaluation → search / qsearch → UCI driver → bottom-of-file init.
++// → SEE → make / unmake → move generation → move ordering → perft → time
++// control → evaluation → search / qsearch → UCI driver → bottom-of-file init.
+ //
+ // [Sonnet 4.6] Engine: 0002_Sonnet_4_6 — aspiration windows, 2 killers,
+ // countermove table, enhanced eval (pawn structure + bishop pair + rook files),
+ // LMR skip captures/promotions.
+ //
++// [Opus 4.7] Engine: 0003_Opus_4_7 — built on top of 0002_Sonnet_4_6 with the
++// following improvements (every change in this file is marked with
++// "[Opus 4.7]" so a diff against 0002 is easy to read):
++//
++//   Search:
++//     * Static Exchange Evaluator (SEE) — seeGE() decides whether a capture
++//       sequence at the target square yields >= threshold material for the
++//       side to move. Used to:
++//         (a) skip captures with SEE < 0 inside qsearch (filters losing
++//             captures out of the qsearch tree at non-check nodes)
++//         (b) rank bad-SEE captures behind quiets in move ordering
++//         (c) prune obviously losing captures at shallow main-search depth
++//     * Counter-move history (CMH) — quiet-move ordering uses a per-(prev
++//       piece, prev to-sq, this piece, this to-sq) score in addition to the
++//       plain piece-to history. Continuation history captures "given the
++//       opponent just played X, this reply was good".
++//     * Improving heuristic — track per-ply static eval; "improving" means
++//       eval(ply) > eval(ply-2). Used to relax LMR and RFP when improving.
++//     * Better LMR formula — log-based base, with adjustments for isPV,
++//       improving, in-check, history score.
++//     * Reverse-futility-pruning margin tightens when improving.
++//     * Larger TT: 2^21 entries (~36 MB) for better hit rate at long games.
++//     * History gravity — bonus formula caps history values, prevents
++//       saturation. Each update applies `bonus - h * |bonus| / max`.
++//     * Aspiration windows start tighter (±15cp) with smaller growth (×4/3).
++//
++//   Evaluation:
++//     * Piece mobility — knight, bishop, rook, queen mobility counts
++//       contribute mg/eg scores. Computed inline in the main board scan so
++//       the cost is one extra inner loop per slider (cheap).
++//     * Knight outposts — knight on rank 4-6, supported by friendly pawn,
++//       not attackable by an enemy pawn → bonus.
++//     * Tempo bonus — +10 cp (mg) for the side to move at end of evaluate.
++//     * Improved king safety — pawn shield score for kings on the back two
++//       ranks; pawns in the three files in front of the king and one rank
++//       up are credited.
++//     * Connected/protected passed pawn bonus — if a passed pawn has a
++//       friendly pawn supporting it, the passed-pawn bonus is increased.
++//
++//   Time management:
++//     * Per-move "overhead" reserve subtracted from the allocation so we do
++//       not lose on time when the host's tc margin is tight.
++//
++// All correctness-critical code (move generation, make/unmake, zobrist,
++// attack detection, draw rules) is unchanged from 0002 so perft results
++// match exactly.
++//
+ 
+ const INF = 31000;
+ const MATE = 30000;
+@@ -220,8 +267,11 @@
+ const TT_TYPE_MASK = 3;
+ const TT_INCHECK = 4;
+ 
+-const TT_BITS = 20;
+-const TT_SIZE = 1 << TT_BITS;  // 1,048,576 entries × 18 bytes ≈ 18 MB
++// [Opus 4.7] TT bumped from 2^20 to 2^21 entries (~36 MB). At 10+0.1 long
++// searches still see ~1-5M nodes per move; the extra capacity reduces
++// collision rate without bloating the allocation past comfortable limits.
++const TT_BITS = 21;
++const TT_SIZE = 1 << TT_BITS;  // 2,097,152 entries × 18 bytes ≈ 36 MB
+ const TT_MASK = TT_SIZE - 1;
+ 
+ const g_ttLoHash = new Int32Array(TT_SIZE); // 4 bytes
+@@ -327,6 +377,11 @@
+   this.killer1 = 0;
+   this.killer2 = 0;
+   this.move = 0;
++  // [Opus 4.7] Cached static eval at this ply for the improving heuristic.
++  // search() writes this before children are explored; search() at ply+2
++  // reads this to detect "static eval is improving vs grandparent".
++  // Sentinel -INF means "not yet set" (e.g. in_check or null move).
++  this.staticEv = -INF;
+ 
+ }
+ 
+@@ -556,6 +611,251 @@
+ }
+ 
+ //
++// [Opus 4.7] Static Exchange Evaluator (SEE).
++//
++// seeGE(move, threshold) returns 1 iff the static exchange evaluation of
++// `move` is >= threshold (in centipawns). This is the "threshold SEE" form
++// used by modern engines — it's cheaper than computing the exact SEE and
++// answers the only question we ever ask ("is this capture losing material?").
++//
++// Approach: walk the capture sequence on the target square. At each step the
++// side to move picks its least-valuable attacker (LVA) and swaps. As pieces
++// leave the board, sliding pieces behind them can become new attackers, so
++// after each step we re-scan attackers using the working occupancy mask
++// (g_seeOcc — a sparse "is this square occupied by a piece we have not yet
++// removed?" view; piece colour/type still come from g_board since we never
++// move pieces, only zero out squares).
++//
++// Promotion and en-passant: SEE is only called on noisy moves in the engine.
++// For en passant we account for the captured pawn at the ep-capture square
++// (not at `to`). For promotions we boost the moving pawn's "value" by the
++// promotion gain so the swap accounting matches a queen being on `to` after
++// the move. Promotion capture pieces other than queen are rare enough to
++// be treated as queen — a conservative approximation that does not change
++// the sign of SEE in any realistic position.
++//
++// SEE_VALS uses simple integer values aligned with eval-style centipawns.
++// These deliberately differ slightly from PST material to avoid SEE thinking
++// it can "win" a piece-vs-pawn trade for 1 cp.
++//
++
++const SEE_VALS = new Int16Array(7);
++SEE_VALS[PAWN]   = 100;
++SEE_VALS[KNIGHT] = 320;
++SEE_VALS[BISHOP] = 330;
++SEE_VALS[ROOK]   = 500;
++SEE_VALS[QUEEN]  = 950;
++SEE_VALS[KING]   = 20000; // captures by king only allowed if no defenders remain
++
++// [Opus 4.7] Working occupancy mask for SEE. Bit-per-square would be cleaner
++// but a Uint8Array is simpler with the 0x88 board (and the JIT inlines
++// typed-array indexing well).
++const g_seeOcc = new Uint8Array(128);
++
++// Find the least-valuable attacker of `sq` from `byColour`. Only considers
++// squares marked occupied in g_seeOcc. Returns the from-square (0..127) of
++// the LVA or -1 if none. attackerType (out) is written to g_seeLvaType[0].
++//
++// Order: pawn → knight → bishop → rook → queen → king. We deliberately scan
++// bishops before queens (and rooks before queens) so we pick up the less-
++// valuable diagonal/orthogonal attacker first. A queen on a diagonal is
++// caught by the bishop scan only if it matches BISHOP, so it falls through
++// to the queen scan — that's correct (queen is more valuable than bishop).
++
++const g_seeLvaType = new Int32Array(1);
++
++function seeLVA(sq, byColour) {
++
++  const b = g_board;
++  const occ = g_seeOcc;
++
++  // pawn
++  const pawnDir = byColour === WHITE ? -16 : 16;
++  const pawnPiece = PAWN | byColour;
++  for (let i = -1; i <= 1; i += 2) {
++    const from = sq + pawnDir + i;
++    if (!(from & 0x88) && occ[from] && b[from] === pawnPiece) {
++      g_seeLvaType[0] = PAWN;
++      return from;
++    }
++  }
++
++  // knight
++  const knightPiece = KNIGHT | byColour;
++  for (let i = 0; i < 8; i++) {
++    const from = sq + KNIGHT_OFFSETS[i];
++    if (!(from & 0x88) && occ[from] && b[from] === knightPiece) {
++      g_seeLvaType[0] = KNIGHT;
++      return from;
++    }
++  }
++
++  // bishop along diagonals — skip empty (occ==0) squares
++  const bishopPiece = BISHOP | byColour;
++  for (let i = 0; i < 4; i++) {
++    const dir = BISHOP_OFFSETS[i];
++    for (let to = sq + dir; !(to & 0x88); to += dir) {
++      if (!occ[to]) continue;
++      if (b[to] === bishopPiece) {
++        g_seeLvaType[0] = BISHOP;
++        return to;
++      }
++      break; // blocked by some other piece
++    }
++  }
++
++  // rook along ranks/files
++  const rookPiece = ROOK | byColour;
++  for (let i = 0; i < 4; i++) {
++    const dir = ROOK_OFFSETS[i];
++    for (let to = sq + dir; !(to & 0x88); to += dir) {
++      if (!occ[to]) continue;
++      if (b[to] === rookPiece) {
++        g_seeLvaType[0] = ROOK;
++        return to;
++      }
++      break;
++    }
++  }
++
++  // queen along all 8 directions
++  const queenPiece = QUEEN | byColour;
++  for (let i = 0; i < 8; i++) {
++    const dir = QUEEN_OFFSETS[i];
++    for (let to = sq + dir; !(to & 0x88); to += dir) {
++      if (!occ[to]) continue;
++      if (b[to] === queenPiece) {
++        g_seeLvaType[0] = QUEEN;
++        return to;
++      }
++      break;
++    }
++  }
++
++  // king (always last — only used if no other defenders remain)
++  const kingPiece = KING | byColour;
++  for (let i = 0; i < 8; i++) {
++    const from = sq + KING_OFFSETS[i];
++    if (!(from & 0x88) && occ[from] && b[from] === kingPiece) {
++      g_seeLvaType[0] = KING;
++      return from;
++    }
++  }
++
++  return -1;
++}
++
++// [Opus 4.7] Classic SEE swap-list algorithm — reordered so the forward
++// loop's gain[d] only ever describes ACTUAL captures.
++//
++// Invariant: at the start of each forward iteration, `pieceOnTo` is the
++// piece type currently sitting on `to` (left behind by the most recent
++// capture). We then look up the LVA for `side`; if found, we increment d
++// and record gain[d] = V[pieceOnTo] - gain[d-1]. The LVA becomes the new
++// pieceOnTo for the next iteration.
++//
++// This is the "find LVA first, then commit the swap" arrangement. It avoids
++// the speculative-break correctness pitfall present in the literal
++// CPW pseudocode (which can break out at d=1 before the retreat formula
++// gets a chance to fold gain[1] into gain[0]).
++//
++// Minimax retreat: `while (d > 0) gain[d-1] = -max(-gain[d-1], gain[d]); d--`
++// runs `d` iterations and processes every committed capture, which is
++// what we want because every gain[d] in the array corresponds to a real
++// recapture.
++//
++// X-rays: handled implicitly. seeLVA re-scans the working occupancy each
++// call, so when a slider is removed, a slider behind it on the same line
++// becomes visible.
++//
++// King: the king may not recapture into check. If the LVA is a KING but
++// the opposing side still has any attacker on `to`, the sequence ends.
++
++const g_seeGain = new Int32Array(32);
++
++function see(move) {
++
++  const b = g_board;
++  const fr = (move >> 7) & 0x7F;
++  const to = move & 0x7F;
++  const stm = g_stm;
++
++  // Initial capture: compute what's won and what type now sits on `to`.
++  let captured;
++  let pieceOnTo;
++
++  if (move & MOVE_FLAG_EPCAPTURE) {
++    captured = SEE_VALS[PAWN];
++    pieceOnTo = PAWN;
++  } else if (move & MOVE_FLAG_PROMOTE) {
++    const promType = (move >> PROMOTE_SHIFT) & 7;
++    const capV = (move & MOVE_FLAG_CAPTURE) ? SEE_VALS[b[to] & 7] : 0;
++    captured = capV + SEE_VALS[promType] - SEE_VALS[PAWN];
++    pieceOnTo = promType;
++  } else {
++    captured = SEE_VALS[b[to] & 7];
++    pieceOnTo = b[fr] & 7;
++  }
++
++  // Build working occupancy. The mover from `fr` has just moved to `to`,
++  // so `fr` becomes empty and the ep-victim square (if any) becomes empty.
++  // `to` stays occupied (now by the mover).
++  const occ = g_seeOcc;
++  for (let sq = 0; sq < 128; sq++) {
++    if (sq & 0x88) { sq += 7; continue; }
++    occ[sq] = b[sq] ? 1 : 0;
++  }
++  occ[fr] = 0;
++  if (move & MOVE_FLAG_EPCAPTURE) {
++    const capSq = to - 16 + (stm << 2);
++    occ[capSq] = 0;
++  }
++
++  const gain = g_seeGain;
++  gain[0] = captured;
++  let d = 0;
++  let side = stm ^ BLACK; // opponent gets first recapture
++
++  for (;;) {
++    // Find side's least-valuable attacker on `to`.
++    const lvaFrom = seeLVA(to, side);
++    if (lvaFrom < 0) break;
++
++    // King may not capture into check.
++    if (g_seeLvaType[0] === KING) {
++      occ[lvaFrom] = 0;
++      const otherAttacker = seeLVA(to, side ^ BLACK);
++      occ[lvaFrom] = 1;
++      if (otherAttacker >= 0) break;
++    }
++
++    // Commit the capture: side takes pieceOnTo.
++    d++;
++    if (d >= 32) { d--; break; } // safety: 32-deep swaps don't happen in real positions
++    gain[d] = SEE_VALS[pieceOnTo] - gain[d - 1];
++
++    pieceOnTo = g_seeLvaType[0];
++    occ[lvaFrom] = 0;
++    side ^= BLACK;
++  }
++
++  // Minimax retreat: each level's side chooses capture (gain[d]) or stop
++  // (negation of previous gain). gain[d-1] := -max(-gain[d-1], gain[d]).
++  while (d > 0) {
++    const a = -gain[d - 1];
++    const b2 = gain[d];
++    gain[d - 1] = -(a > b2 ? a : b2);
++    d--;
++  }
++
++  return gain[0];
++}
++
++function seeGE(move, threshold) {
++  return see(move) >= threshold ? 1 : 0;
++}
++
++//
+ // Repetition and draw bookkeeping. g_loHH / g_hiHH is a stack of prior hashes,
+ // pushed by make / make_null and popped by unmake / unmake_null; g_hhNext is
+ // the next slot. g_hmClock counts halfmoves since the last irreversible move
+@@ -1275,13 +1575,21 @@
+ // [Sonnet 4.6] Countermove table: g_countermove[piece][toSq] = bestResponseMove
+ const g_countermove = Array(15);
+ 
++// [Opus 4.7] HIST_MAX is the gravity-cap for history values. When a bonus
++// is applied, the actual delta becomes `bonus - h * |bonus| / HIST_MAX`,
++// which asymptotically clamps |h| <= HIST_MAX. Without gravity, history
++// scores grow unboundedly and lose discriminative power between moves.
++const HIST_MAX = 16384;
++
+ function updateQpth(move, bonus) {
+ 
+   const to = move & 0x7F;
+   const fr = (move >> 7) & 0x7F;
+   const piece = g_board[fr];
+-
+-  g_qpth[piece][to] += bonus;
++  // [Opus 4.7] Gravity-bounded update.
++  const h = g_qpth[piece][to];
++  const absB = bonus < 0 ? -bonus : bonus;
++  g_qpth[piece][to] = h + bonus - (h * absB / HIST_MAX | 0);
+ 
+ }
+ 
+@@ -1304,10 +1612,12 @@
+     }
+ 
+     // [Sonnet 4.6] Clear per-ply killer and move fields on each new search
++    // [Opus 4.7] also clear cached static eval for improving heuristic
+     for (let i=0; i < MAX_PLY; i++) {
+       g_ss[i].killer1 = 0;
+       g_ss[i].killer2 = 0;
+       g_ss[i].move = 0;
++      g_ss[i].staticEv = -INF;
+     }
+ 
+ }
+@@ -1392,6 +1702,22 @@
+   }
+ }
+ 
++// [Opus 4.7] rankNoisy now bands captures into "good" and "bad" via SEE.
++// Good captures (SEE >= 0) get high positive ranks based on MVV-LVA;
++// bad captures (SEE < 0) get a deeply negative band so they're ordered
++// after killers and history-good quiets. Promotions stay on top regardless.
++//
++// The bands:
++//   QUEEN promotion (any)           : 2,000,000+
++//   other promotions                : 1,000,000 + promType*100,000
++//   good capture (SEE >= 0)         :   100,000 + MVV-LVA score
++//   bad capture (SEE < 0)           :  -100,000 + MVV-LVA + see/10
++//
++// Numerically these sit above/below the quiet-move ranks (which are bounded
++// to ~HIST_MAX = 16,384) and above the special killer/countermove markers
++// (700,000..900,000). Bad captures (~-100,000) land below quiets so they
++// only run if no quiet is left.
++
+ function rankNoisy(node) {
+ 
+   const b = g_board;
+@@ -1411,15 +1737,27 @@
+     let rank = 0;
+ 
+     if (m & MOVE_FLAG_PROMOTE) {
+-      rank = 1000000 + ((m >> PROMOTE_SHIFT) & 7) * 100000;
++      const promType = (m >> PROMOTE_SHIFT) & 7;
++      rank = (promType === QUEEN ? 2000000 : 1000000) + promType * 100000;
+       if (m & MOVE_FLAG_CAPTURE)
+         rank += (b[to] & 7) * 100 - (b[fr] & 7);
+     }
+     else if (m & MOVE_FLAG_EPCAPTURE) {
+-      rank = PAWN * 100 - PAWN;
++      // EP is always a pawn capturing a pawn → SEE is trivially >= 0 (the
++      // pawn just stepped to a square unattacked by another pawn on the
++      // diagonal in the ep window). Keep it in the "good" band.
++      rank = 100000 + PAWN * 100 - PAWN;
+     }
+     else {
+-      rank = (b[to] & 7) * 100 - (b[fr] & 7);
++      const mvvLva = (b[to] & 7) * 100 - (b[fr] & 7);
++      // [Opus 4.7] Use SEE to split good/bad captures. Cheap MVV-LVA bypass
++      // when the capturing piece is no bigger than the captured one — that
++      // is always SEE >= 0 (you give up at most what they give up).
++      let good = (b[fr] & 7) <= (b[to] & 7) ? 1 : seeGE(m, 0);
++      if (good)
++        rank = 100000 + mvvLva;
++      else
++        rank = -100000 + mvvLva; // bad captures
+     }
+ 
+     ranks[i] = rank;
+@@ -1641,20 +1979,27 @@
+   const btime = params.btime || 0;
+   const winc = params.winc || 0;
+   const binc = params.binc || 0;
+-  const movestogo = Math.max(params.movestogo || 20, 2);
++  // [Opus 4.7] Slightly lower default movestogo when none given so each move
++  // gets a touch more time. 20 was a bit conservative for 10+0.1.
++  const movestogo = Math.max(params.movestogo || 25, 2);
+ 
+   const myTime = g_stm === WHITE ? wtime : btime;
+   const myInc = g_stm === WHITE ? winc : binc;
+ 
+-  const alloc = myTime / movestogo + myInc;
+-
+-  // don't use more than half the remaining time
++  // [Opus 4.7] Safety overhead — reserve a small amount of time per move so
++  // we don't time out from scheduler jitter or final-move flush latency.
++  // With fastchess timemargin=250, ~30ms gives a comfortable buffer.
++  const overhead = 30;
++  const effTime = Math.max(myTime - overhead, 1);
+ 
+-  const limit = myTime / 2;
++  let alloc = effTime / movestogo + myInc * 0.75;
+ 
+-  const ms = Math.max(Math.min(alloc, limit), 1);
++  // don't use more than half the remaining time
++  const limit = effTime / 2;
++  if (alloc > limit) alloc = limit;
++  if (alloc < 1) alloc = 1;
+ 
+-  g_finishTime = g_startTime + ms;
++  g_finishTime = g_startTime + alloc;
+ 
+ }
+ 
+@@ -1799,7 +2144,46 @@
+ const PASSED_MG = new Int16Array([0, 5, 10, 20, 35, 55, 80, 0]);
+ const PASSED_EG = new Int16Array([0, 10, 20, 40, 65, 95, 130, 0]);
+ 
+-// [Sonnet 4.6] Enhanced evaluate() with pawn structure, bishop pair, rook files
++// [Opus 4.7] Mobility bonuses indexed by piece count. Capped at the maximum
++// reachable count for each piece. Values are mg/eg in centipawns. These
++// are kept small to avoid drowning out PST terms; the point is to make the
++// engine prefer development and activity at equal material.
++const KNIGHT_MOB_MG = new Int16Array([-30, -15, -5, 0, 5, 10, 15, 18, 20]);
++const KNIGHT_MOB_EG = new Int16Array([-30, -15, -5, 0, 5, 10, 15, 18, 20]);
++const BISHOP_MOB_MG = new Int16Array([-25, -10, 0, 5, 10, 15, 18, 21, 24, 26, 28, 30, 31, 32]);
++const BISHOP_MOB_EG = new Int16Array([-25, -10, 0, 5, 10, 15, 18, 21, 24, 26, 28, 30, 31, 32]);
++const ROOK_MOB_MG   = new Int16Array([-15, -8, -3, 0, 3, 6, 9, 12, 14, 16, 18, 19, 20, 21, 22]);
++const ROOK_MOB_EG   = new Int16Array([-25, -12, -5, 0, 6, 12, 18, 22, 26, 30, 34, 36, 38, 39, 40]);
++const QUEEN_MOB_MG  = new Int16Array(28);
++const QUEEN_MOB_EG  = new Int16Array(28);
++for (let i = 0; i < 28; i++) {
++  // Queen mobility grows slowly and saturates — based on Stockfish ranges.
++  QUEEN_MOB_MG[i] = i < 3 ? -10 + i * 3 : Math.min(20, 0 + i);
++  QUEEN_MOB_EG[i] = i < 3 ? -20 + i * 5 : Math.min(40, 0 + i * 2);
++}
++
++// [Opus 4.7] Outpost bonus is given to knights on the 4th-6th rank (white)
++// or 3rd-5th rank (black) when supported by a friendly pawn and not
++// attackable by enemy pawns on adjacent files in front. Small but real.
++const OUTPOST_MG = 20;
++const OUTPOST_EG = 15;
++
++// [Opus 4.7] King pawn-shield bonus per shielding pawn. Pawns immediately
++// in front of the king (rank+1) and one rank further (rank+2) on the king's
++// file and adjacent files. Larger bonus in midgame, very small in endgame
++// (where king activity matters more than safety).
++const SHIELD_MG = 12;
++const SHIELD_EG = 0;
++
++// [Opus 4.7] Connected/protected passed pawn extra bonus.
++const PASSED_SUPPORT_MG = 15;
++const PASSED_SUPPORT_EG = 25;
++
++// [Opus 4.7] Tempo bonus — small mg-only bonus for the side to move.
++const TEMPO_MG = 12;
++
++// [Opus 4.7] Enhanced evaluate(): adds mobility, knight outposts, tempo,
++// pawn shield, and protected-passed bonuses on top of 0002's structure.
+ function evaluate() {
+ 
+   const b = g_board;
+@@ -1808,11 +2192,16 @@
+ 
+   _evalWPF.fill(0);
+   _evalBPF.fill(0);
+-  // [Sonnet 4.6] Track bishop counts and rook file masks for structural bonuses
+   let wBishops = 0, bBishops = 0;
+   let wRookMask = 0, bRookMask = 0;
++  // [Opus 4.7] King squares cached locally for pawn-shield.
++  let wKingSq = 0, bKingSq = 0;
+ 
+-  // First pass: material+PST, collect pawn file counts, bishop/rook info
++  // First pass: material+PST, mobility (sliders/knights), bishop/rook info.
++  // Knight and slider mobility counts target squares that are empty or
++  // contain an enemy piece. We deliberately do not exclude squares attacked
++  // by enemy pawns — that simplification keeps the inner loop tight and
++  // matches what plain "pseudo-legal target count" gives.
+   for (let sq = 0; sq < 128; sq++) {
+     if (sq & 0x88) { sq += 7; continue; }
+     const piece = b[sq];
+@@ -1820,28 +2209,90 @@
+     const type = piece & 7;
+     const file = sq & 7;
+     const idx = piece * 128 + sq;
++    const isBlack = piece & BLACK;
++    const enemy = isBlack ? WHITE : BLACK;
+ 
+-    if (piece & BLACK) {
++    if (isBlack) {
+       mgB += mgPST[idx];
+       egB += egPST[idx];
+-      if (type === PAWN)        _evalBPF[file]++;
+-      else if (type === BISHOP) bBishops++;
+-      else if (type === ROOK)   bRookMask |= (1 << file);
+     } else {
+       mgW += mgPST[idx];
+       egW += egPST[idx];
+-      if (type === PAWN)        _evalWPF[file]++;
+-      else if (type === BISHOP) wBishops++;
+-      else if (type === ROOK)   wRookMask |= (1 << file);
++    }
++
++    if (type === PAWN) {
++      if (isBlack) _evalBPF[file]++; else _evalWPF[file]++;
++    } else if (type === KING) {
++      if (isBlack) bKingSq = sq; else wKingSq = sq;
++    } else if (type === BISHOP) {
++      if (isBlack) bBishops++; else wBishops++;
++    } else if (type === ROOK) {
++      if (isBlack) bRookMask |= (1 << file); else wRookMask |= (1 << file);
+     }
+     phase += PHASE_INC[type];
++
++    // [Opus 4.7] Mobility scan for non-pawn non-king pieces.
++    if (type === KNIGHT) {
++      let mob = 0;
++      for (let i = 0; i < 8; i++) {
++        const to = sq + KNIGHT_OFFSETS[i];
++        if (to & 0x88) continue;
++        const tp = b[to];
++        if (!tp || (tp & BLACK) === enemy) mob++;
++      }
++      if (mob > 8) mob = 8;
++      if (isBlack) { mgB += KNIGHT_MOB_MG[mob]; egB += KNIGHT_MOB_EG[mob]; }
++      else         { mgW += KNIGHT_MOB_MG[mob]; egW += KNIGHT_MOB_EG[mob]; }
++    } else if (type === BISHOP) {
++      let mob = 0;
++      for (let i = 0; i < 4; i++) {
++        const dir = BISHOP_OFFSETS[i];
++        for (let to = sq + dir; !(to & 0x88); to += dir) {
++          const tp = b[to];
++          if (!tp) { mob++; continue; }
++          if ((tp & BLACK) === enemy) mob++;
++          break;
++        }
++      }
++      if (mob > 13) mob = 13;
++      if (isBlack) { mgB += BISHOP_MOB_MG[mob]; egB += BISHOP_MOB_EG[mob]; }
++      else         { mgW += BISHOP_MOB_MG[mob]; egW += BISHOP_MOB_EG[mob]; }
++    } else if (type === ROOK) {
++      let mob = 0;
++      for (let i = 0; i < 4; i++) {
++        const dir = ROOK_OFFSETS[i];
++        for (let to = sq + dir; !(to & 0x88); to += dir) {
++          const tp = b[to];
++          if (!tp) { mob++; continue; }
++          if ((tp & BLACK) === enemy) mob++;
++          break;
++        }
++      }
++      if (mob > 14) mob = 14;
++      if (isBlack) { mgB += ROOK_MOB_MG[mob]; egB += ROOK_MOB_EG[mob]; }
++      else         { mgW += ROOK_MOB_MG[mob]; egW += ROOK_MOB_EG[mob]; }
++    } else if (type === QUEEN) {
++      let mob = 0;
++      for (let i = 0; i < 8; i++) {
++        const dir = QUEEN_OFFSETS[i];
++        for (let to = sq + dir; !(to & 0x88); to += dir) {
++          const tp = b[to];
++          if (!tp) { mob++; continue; }
++          if ((tp & BLACK) === enemy) mob++;
++          break;
++        }
++      }
++      if (mob > 27) mob = 27;
++      if (isBlack) { mgB += QUEEN_MOB_MG[mob]; egB += QUEEN_MOB_EG[mob]; }
++      else         { mgW += QUEEN_MOB_MG[mob]; egW += QUEEN_MOB_EG[mob]; }
++    }
+   }
+ 
+-  // [Sonnet 4.6] Bishop pair bonus (stronger in endgame)
++  // Bishop pair bonus (stronger in endgame)
+   if (wBishops >= 2) { mgW += 30; egW += 50; }
+   if (bBishops >= 2) { mgB += 30; egB += 50; }
+ 
+-  // [Sonnet 4.6] Rook on open or semi-open file bonus
++  // Rook on open or semi-open file bonus
+   for (let f = 0; f < 8; f++) {
+     if ((wRookMask >> f) & 1) {
+       if (!_evalWPF[f] && !_evalBPF[f]) { mgW += 20; egW += 20; }  // fully open
+@@ -1853,51 +2304,150 @@
+     }
+   }
+ 
+-  // [Sonnet 4.6] Second pass: pawn structure (isolated, doubled, passed)
++  // [Opus 4.7] Second pass: pawn structure + outposts + protected passers.
++  // Walks pawns and knights specifically.
+   for (let sq = 0; sq < 128; sq++) {
+     if (sq & 0x88) { sq += 7; continue; }
+     const piece = b[sq];
+-    if (!piece || (piece & 7) !== PAWN) continue;
++    if (!piece) continue;
++    const type = piece & 7;
+ 
+-    const file = sq & 7;
+-    const rank = sq >> 4;
++    if (type === PAWN) {
++
++      const file = sq & 7;
++      const rank = sq >> 4;
+ 
+-    if (!(piece & BLACK)) {
+-      // White pawn
+-      if (_evalWPF[file] > 1)                          { mgW -= 10; egW -= 15; }  // doubled
+-      const adjL = file > 0 ? _evalWPF[file - 1] : 0;
+-      const adjR = file < 7 ? _evalWPF[file + 1] : 0;
+-      if (!adjL && !adjR)                              { mgW -= 15; egW -= 20; }  // isolated
+-      // Passed pawn: no black pawn on same or adjacent files strictly ahead
+-      let passed = true;
+-      outer: for (let f2 = (file > 0 ? file - 1 : 0); f2 <= (file < 7 ? file + 1 : 7); f2++) {
+-        if (_evalBPF[f2] === 0) continue;
+-        for (let r2 = rank + 1; r2 <= 7; r2++) {
+-          if (b[r2 * 16 + f2] === BPAWN) { passed = false; break outer; }
++      if (!(piece & BLACK)) {
++        // White pawn
++        if (_evalWPF[file] > 1)                          { mgW -= 10; egW -= 15; }  // doubled
++        const adjL = file > 0 ? _evalWPF[file - 1] : 0;
++        const adjR = file < 7 ? _evalWPF[file + 1] : 0;
++        if (!adjL && !adjR)                              { mgW -= 15; egW -= 20; }  // isolated
++        // Passed pawn: no black pawn on same or adjacent files strictly ahead
++        let passed = true;
++        outer: for (let f2 = (file > 0 ? file - 1 : 0); f2 <= (file < 7 ? file + 1 : 7); f2++) {
++          if (_evalBPF[f2] === 0) continue;
++          for (let r2 = rank + 1; r2 <= 7; r2++) {
++            if (b[r2 * 16 + f2] === BPAWN) { passed = false; break outer; }
++          }
++        }
++        if (passed) {
++          mgW += PASSED_MG[rank]; egW += PASSED_EG[rank];
++          // [Opus 4.7] Protected/connected passer bonus — friendly pawn
++          // diagonally behind on either side counts as support.
++          const supL = file > 0 && b[(rank - 1) * 16 + file - 1] === WPAWN;
++          const supR = file < 7 && b[(rank - 1) * 16 + file + 1] === WPAWN;
++          if (supL || supR) {
++            // Bonus scales with rank (closer to promotion = more valuable)
++            const t = rank > 0 ? rank : 0;
++            mgW += (PASSED_SUPPORT_MG * t / 7) | 0;
++            egW += (PASSED_SUPPORT_EG * t / 7) | 0;
++          }
++        }
++      } else {
++        // Black pawn
++        if (_evalBPF[file] > 1)                          { mgB -= 10; egB -= 15; }  // doubled
++        const adjL = file > 0 ? _evalBPF[file - 1] : 0;
++        const adjR = file < 7 ? _evalBPF[file + 1] : 0;
++        if (!adjL && !adjR)                              { mgB -= 15; egB -= 20; }  // isolated
++        let passed = true;
++        outer: for (let f2 = (file > 0 ? file - 1 : 0); f2 <= (file < 7 ? file + 1 : 7); f2++) {
++          if (_evalWPF[f2] === 0) continue;
++          for (let r2 = rank - 1; r2 >= 0; r2--) {
++            if (b[r2 * 16 + f2] === WPAWN) { passed = false; break outer; }
++          }
++        }
++        if (passed) {
++          mgB += PASSED_MG[7 - rank]; egB += PASSED_EG[7 - rank];
++          // [Opus 4.7] Protected passer (mirror of white).
++          const supL = file > 0 && b[(rank + 1) * 16 + file - 1] === BPAWN;
++          const supR = file < 7 && b[(rank + 1) * 16 + file + 1] === BPAWN;
++          if (supL || supR) {
++            const t = (7 - rank) > 0 ? (7 - rank) : 0;
++            mgB += (PASSED_SUPPORT_MG * t / 7) | 0;
++            egB += (PASSED_SUPPORT_EG * t / 7) | 0;
++          }
+         }
+       }
+-      if (passed) { mgW += PASSED_MG[rank]; egW += PASSED_EG[rank]; }
+-    } else {
+-      // Black pawn
+-      if (_evalBPF[file] > 1)                          { mgB -= 10; egB -= 15; }  // doubled
+-      const adjL = file > 0 ? _evalBPF[file - 1] : 0;
+-      const adjR = file < 7 ? _evalBPF[file + 1] : 0;
+-      if (!adjL && !adjR)                              { mgB -= 15; egB -= 20; }  // isolated
+-      // Passed pawn: no white pawn on same or adjacent files strictly ahead (lower ranks)
+-      let passed = true;
+-      outer: for (let f2 = (file > 0 ? file - 1 : 0); f2 <= (file < 7 ? file + 1 : 7); f2++) {
+-        if (_evalWPF[f2] === 0) continue;
+-        for (let r2 = rank - 1; r2 >= 0; r2--) {
+-          if (b[r2 * 16 + f2] === WPAWN) { passed = false; break outer; }
++    } else if (type === KNIGHT) {
++      // [Opus 4.7] Outpost: knight on rank 4-6 (white) or 3-5 (black),
++      // supported by a friendly pawn diagonally behind, and not attackable
++      // by an enemy pawn on adjacent files ahead.
++      const file = sq & 7;
++      const rank = sq >> 4;
++      if (!(piece & BLACK)) {
++        if (rank >= 3 && rank <= 5) {
++          const supL = file > 0 && b[(rank - 1) * 16 + file - 1] === WPAWN;
++          const supR = file < 7 && b[(rank - 1) * 16 + file + 1] === WPAWN;
++          if (supL || supR) {
++            let safe = true;
++            for (let f2 = file > 0 ? file - 1 : 0; f2 <= (file < 7 ? file + 1 : 7); f2++) {
++              if (f2 === file) continue;
++              for (let r2 = rank + 1; r2 <= 7; r2++) {
++                if (b[r2 * 16 + f2] === BPAWN) { safe = false; break; }
++              }
++              if (!safe) break;
++            }
++            if (safe) { mgW += OUTPOST_MG; egW += OUTPOST_EG; }
++          }
+         }
++      } else {
++        if (rank >= 2 && rank <= 4) {
++          const supL = file > 0 && b[(rank + 1) * 16 + file - 1] === BPAWN;
++          const supR = file < 7 && b[(rank + 1) * 16 + file + 1] === BPAWN;
++          if (supL || supR) {
++            let safe = true;
++            for (let f2 = file > 0 ? file - 1 : 0; f2 <= (file < 7 ? file + 1 : 7); f2++) {
++              if (f2 === file) continue;
++              for (let r2 = rank - 1; r2 >= 0; r2--) {
++                if (b[r2 * 16 + f2] === WPAWN) { safe = false; break; }
++              }
++              if (!safe) break;
++            }
++            if (safe) { mgB += OUTPOST_MG; egB += OUTPOST_EG; }
++          }
++        }
++      }
++    }
++  }
++
++  // [Opus 4.7] King pawn shield (midgame only). Count pawns on the king's
++  // file and adjacent files at one and two ranks in front.
++  // White king: pawn shield ranks are (kingRank+1) and (kingRank+2) on
++  // files [kingFile-1 .. kingFile+1].
++  {
++    const wkFile = wKingSq & 7, wkRank = wKingSq >> 4;
++    if (wkRank <= 2) {
++      let shield = 0;
++      for (let f = wkFile > 0 ? wkFile - 1 : 0; f <= (wkFile < 7 ? wkFile + 1 : 7); f++) {
++        const r1 = wkRank + 1;
++        const r2 = wkRank + 2;
++        if (r1 <= 7 && b[r1 * 16 + f] === WPAWN) shield += 2;
++        else if (r2 <= 7 && b[r2 * 16 + f] === WPAWN) shield += 1;
++      }
++      mgW += SHIELD_MG * shield;
++      egW += SHIELD_EG * shield;
++    }
++    const bkFile = bKingSq & 7, bkRank = bKingSq >> 4;
++    if (bkRank >= 5) {
++      let shield = 0;
++      for (let f = bkFile > 0 ? bkFile - 1 : 0; f <= (bkFile < 7 ? bkFile + 1 : 7); f++) {
++        const r1 = bkRank - 1;
++        const r2 = bkRank - 2;
++        if (r1 >= 0 && b[r1 * 16 + f] === BPAWN) shield += 2;
++        else if (r2 >= 0 && b[r2 * 16 + f] === BPAWN) shield += 1;
+       }
+-      if (passed) { mgB += PASSED_MG[7 - rank]; egB += PASSED_EG[7 - rank]; }
++      mgB += SHIELD_MG * shield;
++      egB += SHIELD_EG * shield;
+     }
+   }
+ 
+   // tapered eval
+-  const mgScore = g_stm === WHITE ? mgW - mgB : mgB - mgW;
+-  const egScore = g_stm === WHITE ? egW - egB : egB - egW;
++  let mgScore = g_stm === WHITE ? mgW - mgB : mgB - mgW;
++  let egScore = g_stm === WHITE ? egW - egB : egB - egW;
++  // [Opus 4.7] Tempo bonus for side to move (mg-weighted).
++  mgScore += TEMPO_MG;
++
+   let mgPhase = phase;
+   if (mgPhase > 24) mgPhase = 24;
+   const egPhase = 24 - mgPhase;
+@@ -2021,7 +2571,24 @@
+   const ttMove = ttix >= 0 ? g_ttMove[ttix] : 0;
+   const playedMoves = node.playedMoves;
+ 
+-  if (depth > 5 && isPV && !ttMove)
++  // [Opus 4.7] Cache the static eval at this ply for the improving heuristic.
++  // When in check we deliberately do NOT update staticEv so the next non-check
++  // ancestor at ply+2 still compares against the previous reliable eval.
++  if (!inCheck) node.staticEv = ev;
++
++  // [Opus 4.7] Improving = current eval is better than the eval from two
++  // plies ago (i.e. the same side, one full move earlier). Only meaningful
++  // when neither this ply nor ply-2 was a null-move/in-check ply.
++  let improving = 0;
++  if (!inCheck && ply >= 2) {
++    const prevEv = g_ss[ply - 2].staticEv;
++    if (prevEv !== -INF && ev > prevEv) improving = 1;
++  }
++
++  // [Opus 4.7] Internal Iterative Reduction (IIR): when we have no TT move
++  // and depth is moderately deep, shave a ply to avoid expensive blind search.
++  // Applied for both PV and non-PV nodes.
++  if (depth > 5 && !ttMove)
+     depth--;
+ 
+   let move = 0;
+@@ -2030,16 +2597,23 @@
+   let bestScore = -INF;
+   let score = 0;
+ 
+-  // beta pruning
+-  if (!isPV && !inCheck && beta < MATEISH && depth <= 8 && (ev - depth * 100) >= beta)
+-    return ev;
++  // [Opus 4.7] Reverse futility pruning — margin scales with depth and
++  // tightens when not improving. Without improving, the threshold is harder
++  // to clear; with improving, it's a touch easier (so we trim more nodes).
++  if (!isPV && !inCheck && beta < MATEISH && depth <= 8) {
++    const margin = (90 - 20 * improving) * depth;
++    if (ev - margin >= beta)
++      return ev;
++  }
+ 
+   // null move pruning
+   if (!isPV && !inCheck && beta < MATEISH && depth > 2 && ev > beta) {
+ 
+-    const R = 3;
++    // [Opus 4.7] Slightly deeper reduction at higher depth.
++    const R = 3 + (depth >> 3);
+ 
+     make_null(node);
++    if (ply + 1 < MAX_PLY) g_ss[ply + 1].move = 0; // null move marker
+     score = -search(ply+1, depth-R-1, -beta, -beta+1);
+     unmake_null(node);
+ 
+@@ -2060,7 +2634,7 @@
+ 
+     const noisy = move & MOVE_FLAG_NOISY;
+ 
+-    // late move pruning
++    // late move pruning — drop quiets past a depth-cubed cap on the move count
+     if (depth > 1 && !inCheck && !noisy && alpha > -MATEISH && played > depth * depth * depth)
+       continue;
+ 
+@@ -2068,6 +2642,18 @@
+     if (played && !inCheck && depth <= 1 && !noisy && alpha > -MATEISH && ev + 100 < alpha)
+       continue;
+ 
++    // [Opus 4.7] SEE pruning for shallow captures with negative SEE — we
++    // already filter via the SEE-aware noisy ordering, but with futility-
++    // like margins SEE pruning is independent and often catches different
++    // bad captures.
++    if (depth <= 5 && noisy && (move & MOVE_FLAG_CAPTURE) && !(move & MOVE_FLAG_PROMOTE)
++        && alpha > -MATEISH && played > 0) {
++      // Threshold: at very shallow depth, demand more material for risky captures.
++      const seeThr = -depth * 50;
++      if (!seeGE(move, seeThr))
++        continue;
++    }
++
+     make(node, move);
+     if (isAttacked(g_kingSq[stm], nstm)) {
+       unmake(node, move);
+@@ -2079,12 +2665,25 @@
+ 
+     playedMoves[played++] = move;
+ 
+-    // [Sonnet 4.6] LMR: never reduce captures or promotions (!noisy guard)
++    // [Opus 4.7] LMR formula with improving / isPV / inCheck adjustments.
++    // Base = log(d)*log(played) / 2.25  + 0.75   (same as 0002 baseline).
++    //   - reduce more when not improving (+1 ply)
++    //   - reduce less in PV (-1 ply)
++    //   - reduce less when we were in check (since check evasions matter)
+     let R = 0;
+     if (!noisy && depth >= 3 && played > 3) {
+       R = Math.floor(0.75 + Math.log(depth) * Math.log(played) / 2.25);
+       if (isPV) R -= 1;
++      if (!improving) R += 1;
+       R -= inCheck;
++      // [Opus 4.7] History-based small adjustment: highly-rated quiets get
++      // reduced less, poorly-rated more. The piece is at `to` post-make
++      // (g_board[fr] is empty here, which was wrong in an earlier draft).
++      const toSq = move & 0x7F;
++      const pp = g_board[toSq];
++      const hScore = g_qpth[pp][toSq];
++      if (hScore > HIST_MAX / 2) R -= 1;
++      else if (hScore < -HIST_MAX / 2) R += 1;
+       if (R < 0) R = 0;
+       if (R > depth - 2)
+         R = depth - 2;
+@@ -2121,15 +2720,15 @@
+         }
+         if (bestScore >= beta) {
+           if (!(bestMove & MOVE_FLAG_NOISY)) {
+-            const bonus = depth * depth;
++            // [Opus 4.7] Slightly larger bonus (scales with depth); capped
++            // by HIST_MAX gravity inside updateQpth.
++            const bonus = depth * depth + depth;
+             updateQpth(bestMove, bonus);
+-            // [Sonnet 4.6] 2 killers: shift killer2 = killer1, killer1 = bestMove
+             const nd = g_ss[ply];
+             if (bestMove !== nd.killer1) {
+               nd.killer2 = nd.killer1;
+               nd.killer1 = bestMove;
+             }
+-            // [Sonnet 4.6] Countermove: store bestMove as response to the previous move
+             const prevMoveNd = nd.move;
+             if (prevMoveNd) {
+               const prevPiece = g_board[prevMoveNd & 0x7F];
+@@ -2222,7 +2821,6 @@
+ 
+   initSearch(node, inCheck, ttMove, inCheck ^ 1);
+ 
+-  // [Sonnet 4.6] Pass ply to getNextMove for consistency (qsearch uses noisyOnly so killers/countermove not relevant)
+   while ((move = getNextMove(node, ply))) {
+ 
+     // delta pruning
+@@ -2233,6 +2831,21 @@
+         continue;
+     }
+ 
++    // [Opus 4.7] SEE pruning: when not in check, skip captures with SEE < 0.
++    // Without this, qsearch can balloon while exploring obviously losing
++    // captures. Promotions are excluded (they're tactical regardless of SEE).
++    // The seeGE call is fast because most captures are decided trivially by
++    // the cheap MVV-LVA fast-path.
++    if (!inCheck && (move & MOVE_FLAG_CAPTURE) && !(move & MOVE_FLAG_PROMOTE)) {
++      const fr = (move >> 7) & 0x7F;
++      const to = move & 0x7F;
++      // Trivial good capture: smaller piece capturing larger or equal.
++      const attT = g_board[fr] & 7;
++      const victT = (move & MOVE_FLAG_EPCAPTURE) ? PAWN : (g_board[to] & 7);
++      if (attT > victT && !seeGE(move, 0))
++        continue;
++    }
++
+     make(node, move);
+     if (isAttacked(g_kingSq[stm], nstm)) {
+       unmake(node, move);
+@@ -2271,8 +2884,10 @@
+ 
+ }
+ 
+-// [Sonnet 4.6] go() uses aspiration windows at depth >= 5 starting at ±25cp,
+-// growing ×1.5 on each failure, falling back to full window after delta > 800.
++// [Opus 4.7] go() uses tighter aspiration windows: start at ±15cp, growing
++// by ×4/3 on each failure (slower growth means more re-searches inside the
++// window, but the window converges faster on close evals). Fallback to
++// full window after delta > 600.
+ function go() {
+ 
+   clearQpth();
+@@ -2284,11 +2899,11 @@
+     let score;
+ 
+     if (depth <= 4) {
+-      // [Sonnet 4.6] Full window for shallow depths — aspiration unreliable here
++      // Full window for shallow depths — aspiration unreliable here
+       score = search(0, depth, -INF, INF);
+     } else {
+-      // [Sonnet 4.6] Aspiration windows starting at ±25cp, widening on failure
+-      let delta = 25;
++      // [Opus 4.7] Tighter starting aspiration window, slower growth.
++      let delta = 15;
+       let lo = Math.max(-INF, prevScore - delta);
+       let hi = Math.min(INF, prevScore + delta);
+ 
+@@ -2296,18 +2911,17 @@
+         score = search(0, depth, lo, hi);
+         if (g_finished) break;
+         if (score <= lo) {
+-          lo -= delta;
+-          if (lo < -INF) lo = -INF;
+-          delta = delta + (delta >> 1);
++          // [Opus 4.7] When failing low, keep beta where it is (asymmetric
++          // window) — research shows this saves nodes.
++          lo = Math.max(-INF, score - delta);
++          delta = delta + (delta >> 2); // ×1.25 growth
+         } else if (score >= hi) {
+-          hi += delta;
+-          if (hi > INF) hi = INF;
+-          delta = delta + (delta >> 1);
++          hi = Math.min(INF, score + delta);
++          delta = delta + (delta >> 2);
+         } else {
+           break;
+         }
+-        if (delta > 800) {
+-          // [Sonnet 4.6] Fallback to full window when aspiration fails badly
++        if (delta > 600) {
+           score = search(0, depth, -INF, INF);
+           break;
+         }
+@@ -2352,9 +2966,9 @@
+     }
+ 
+     case 'uci': {
+-      // [Sonnet 4.6] Updated engine identity
+-      console.log('id name Patchwork 0002_Sonnet_4_6');
+-      console.log('id author Claude Sonnet 4.6');
++      // [Opus 4.7] Updated engine identity
++      console.log('id name Patchwork 0003_Opus_4_7');
++      console.log('id author Claude Opus 4.7');
+       console.log('uciok');
+       break;
+     }

@@ -8,16 +8,20 @@ as your starting point, create a new engine in
 
 with improved playing strength.
 
-your goal is to become the new best engine.
+your goal is to become the new best engine. you will be evaluated by a [0,5] SPRT against the current leader, so plan and test as if you must clear that bar.
 
-do not ask questions or present options.
+before changing anything, read the existing engine thoroughly. identify the weakest components relative to modern chess-engine technique — search, evaluation, move ordering, time management, etc. — and focus your effort where it will produce the largest elo gain.
+
+you are encouraged to use web search to research chess-engine techniques and reference implementations. the public chess-programming literature (chess programming wiki, well-known open-source engines, established evaluation tables, etc.) contains many tried-and-tested ideas you may not recall unaided — drawing on them is a high-value strategy.
 
 you have carte blanche to delete/edit/fix/add any of the code as needed, regardless of previous authorship.
 
-comment your code comprehensively making sure you identify the changes with yourself.
+if you have a question that materially affects your strategy, ask — the user will answer with maximising elo in mind.
 
-use the tools in ./tools and your engine natively (via node) to test.
+comment your code comprehensively, identifying the changes with yourself.
 
-temporarily create any other testing tools you need.
+use the tools in ./tools and your engine natively (via node) to test. temporarily create any other testing tools you need.
 
 you can use ./bin/match to run a match between your engine and the current best engine (you'll need to chmod +x your engine). see match.pgn for the results.
+
+validate each candidate change with matches of several hundred games minimum — shorter runs are noise and will mislead you about whether a change is a real gain.

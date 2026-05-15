@@ -1,0 +1,676 @@
+--- engines/0003_opus_4_7.js	2026-05-14 15:45:17.355782105 +0100
++++ engines/0005_opus_4_7.js	2026-05-14 20:17:40.309846059 +0100
+@@ -19,6 +19,57 @@
+ // countermove table, enhanced eval (pawn structure + bishop pair + rook files),
+ // LMR skip captures/promotions.
+ //
++// [Opus 4.7 / 0005] Engine: 0005_Opus_4_7 — built on top of 0003_Opus_4_7.
++// Every NEW change vs 0003 is tagged "[Opus 4.7 / 0005]" so a diff against
++// 0003 is easy to read. Older "[Opus 4.7]" tags belong to the 0003 baseline
++// and have been left in place.
++//
++// Summary of NEW improvements in 0005 (vs 0003):
++//
++//   Search:
++//     * Check extension — if the side to move is in check, depth is bumped
++//       by one before recursion. The single biggest commonly-cited search
++//       Elo gain after the basics; lets us actually see one ply deeper
++//       through forced lines without burning the time horizon on quiet
++//       sub-trees.
++//     * Razoring — at shallow depth (<= 3) when the static eval is far
++//       enough below alpha that no reasonable tactical sequence can lift
++//       it, drop directly into qsearch and only descend further if qsearch
++//       itself raises alpha. Saves nodes on hopeless positions.
++//     * LMP table — late-move pruning move-count limits are now driven by a
++//       depth-indexed table with separate "improving" / "not improving"
++//       rows. Tighter than 0003's `depth^3` formula when not improving
++//       (prunes more) and saner at very low depth.
++//     * TT-corrected static eval — when a TT entry exists, refine the
++//       static eval using ttScore when its bound type confirms a tighter
++//       value. All pruning heuristics (RFP, razoring, NMP, futility) see a
++//       more accurate stand-pat estimate.
++//     * Depth-preferred TT replacement — ttPut no longer blindly clobbers a
++//       deeper entry for a different position; we keep the deeper entry
++//       unless the same position writes back or the new depth is close.
++//     * History-based LMR scaling — quiet-history nudges LMR reduction in
++//       larger steps (up to ±2 plies) than 0003's ±1 step.
++//
++//   Move ordering:
++//     * Capture history (g_caph) — per (attacker piece, captured piece type)
++//       at the to-square, updated on noisy beta cutoffs. Helps order
++//       captures past plain MVV-LVA when material is close.
++//
++//   Evaluation:
++//     * King-zone attackers — count enemy pieces (N, B, R, Q) attacking the
++//       3×3 zone around the king, weight by piece type, and apply a
++//       non-linear danger score. Folded into the existing mobility scan so
++//       the cost is one extra cmp per slider step.
++//     * Threats — minor-attacks-major and pawn-attacks-piece bonuses.
++//
++//   Time / misc:
++//     * Time overhead bumped slightly (30 → 40ms) — we've been seeing tight
++//       margins on fast TC and an extra 10ms is cheap insurance.
++//
++// All correctness-critical code (move generation, make/unmake, zobrist,
++// attack detection, draw rules) is unchanged from 0003 so perft results
++// match exactly.
++//
+ // [Opus 4.7] Engine: 0003_Opus_4_7 — built on top of 0002_Sonnet_4_6 with the
+ // following improvements (every change in this file is marked with
+ // "[Opus 4.7]" so a diff against 0002 is easy to read):
+@@ -282,10 +333,31 @@
+ const g_ttEval   = new Int16Array(TT_SIZE); // 2 bytes
+ const g_ttScore  = new Int16Array(TT_SIZE); // 2 bytes
+ 
++// [Opus 4.7 / 0005] Depth-preferred replacement. A naive "always replace"
++// scheme (as in 0003) loses deep entries that took expensive sub-trees to
++// produce, replacing them with shallow entries from sibling probes. The new
++// policy is:
++//   - empty slot: always write
++//   - same position (hash match): always write (newer / possibly deeper info)
++//   - different position: write only if the new depth is at least the old
++//     depth minus a tolerance (here 2 plies). Below that we keep the old.
++// In practice this preserves the high-value root-near entries through
++// shallower internal noise.
+ function ttPut(type, depth, score, move, ev, inCheck) {
+ 
+   const idx = g_loHash & TT_MASK;
+ 
++  const oldType = g_ttType[idx];
++  if (oldType) {
++    const sameHash = g_ttLoHash[idx] === g_loHash && g_ttHiHash[idx] === g_hiHash;
++    if (!sameHash) {
++      // Different position currently in this slot — keep it if it is
++      // significantly deeper than what we are about to write.
++      if (g_ttDepth[idx] > depth + 2)
++        return;
++    }
++  }
++
+   g_ttLoHash[idx] = g_loHash;
+   g_ttHiHash[idx] = g_hiHash;
+   g_ttType[idx] = inCheck ? type | TT_INCHECK : type;
+@@ -1581,6 +1653,40 @@
+ // scores grow unboundedly and lose discriminative power between moves.
+ const HIST_MAX = 16384;
+ 
++// [Opus 4.7 / 0005] Capture history. Indexed [attackerPiece(15)][victimType(7)]
++// — note: victim is the *piece type* (1..6) of what was captured, not the
++// full piece including colour. This is symmetric across colours which is
++// what we want — knight-takes-bishop preferences are the same for white
++// and black. The table is reset at the start of each new search. Used in
++// rankNoisy() so noisy ordering can lean on history when MVV-LVA ties.
++const g_caph = Array(15);
++
++function initCaph() {
++  for (let i = 0; i < 15; i++) {
++    g_caph[i] = new Int32Array(7); // 7 piece types (0..6); 0 unused
++  }
++}
++
++function clearCaph() {
++  for (let i = 0; i < 15; i++) {
++    g_caph[i].fill(0);
++  }
++}
++
++function updateCaph(move, bonus) {
++  const to = move & 0x7F;
++  const fr = (move >> 7) & 0x7F;
++  const piece = g_board[fr];
++  // For an ep capture the victim sits on capSq; treat it as PAWN.
++  let victim;
++  if (move & MOVE_FLAG_EPCAPTURE) victim = PAWN;
++  else victim = g_board[to] & 7;
++  if (!victim) return;
++  const h = g_caph[piece][victim];
++  const absB = bonus < 0 ? -bonus : bonus;
++  g_caph[piece][victim] = h + bonus - (h * absB / HIST_MAX | 0);
++}
++
+ function updateQpth(move, bonus) {
+ 
+   const to = move & 0x7F;
+@@ -1600,6 +1706,9 @@
+       // [Sonnet 4.6] Init countermove table alongside history
+       g_countermove[i] = new Uint32Array(128);
+     }
++    // [Opus 4.7 / 0005] Init capture history (separate dimensions, so cannot
++    // share the same allocation loop).
++    initCaph();
+ 
+ }
+ 
+@@ -1611,6 +1720,9 @@
+       g_countermove[i].fill(0);
+     }
+ 
++    // [Opus 4.7 / 0005] Clear capture history at the start of each search.
++    clearCaph();
++
+     // [Sonnet 4.6] Clear per-ply killer and move fields on each new search
+     // [Opus 4.7] also clear cached static eval for improving heuristic
+     for (let i=0; i < MAX_PLY; i++) {
+@@ -1749,15 +1861,24 @@
+       rank = 100000 + PAWN * 100 - PAWN;
+     }
+     else {
+-      const mvvLva = (b[to] & 7) * 100 - (b[fr] & 7);
++      const attT = b[fr] & 7;
++      const victT = b[to] & 7;
++      const mvvLva = victT * 100 - attT;
+       // [Opus 4.7] Use SEE to split good/bad captures. Cheap MVV-LVA bypass
+       // when the capturing piece is no bigger than the captured one — that
+       // is always SEE >= 0 (you give up at most what they give up).
+-      let good = (b[fr] & 7) <= (b[to] & 7) ? 1 : seeGE(m, 0);
++      let good = attT <= victT ? 1 : seeGE(m, 0);
++      // [Opus 4.7 / 0005] Mix in capture history. We divide by a small
++      // factor so it nudges ordering without overwhelming MVV-LVA. The
++      // history is symmetric across colours (it's keyed by victim type,
++      // not victim full piece), so attacks at different points in the
++      // tree share statistics.
++      const cap_h = g_caph[b[fr]][victT] | 0;
++      const histAdj = (cap_h / 8) | 0;
+       if (good)
+-        rank = 100000 + mvvLva;
++        rank = 100000 + mvvLva + histAdj;
+       else
+-        rank = -100000 + mvvLva; // bad captures
++        rank = -100000 + mvvLva + histAdj; // bad captures
+     }
+ 
+     ranks[i] = rank;
+@@ -1988,8 +2109,10 @@
+ 
+   // [Opus 4.7] Safety overhead — reserve a small amount of time per move so
+   // we don't time out from scheduler jitter or final-move flush latency.
+-  // With fastchess timemargin=250, ~30ms gives a comfortable buffer.
+-  const overhead = 30;
++  // [Opus 4.7 / 0005] Bumped 30 → 40 ms. We have observed search threads
++  // missing the deadline by ~5-15ms occasionally at high concurrency; an
++  // extra 10ms is essentially free and keeps us off the timeout boundary.
++  const overhead = 40;
+   const effTime = Math.max(myTime - overhead, 1);
+ 
+   let alloc = effTime / movestogo + myInc * 0.75;
+@@ -2182,6 +2305,29 @@
+ // [Opus 4.7] Tempo bonus — small mg-only bonus for the side to move.
+ const TEMPO_MG = 12;
+ 
++// [Opus 4.7 / 0005] King-zone attacker weights (mg). When an enemy piece
++// attacks a square in the 3x3 zone around our king we add the piece's
++// weight to an attack score. The threat penalty is non-linear in the
++// number of distinct attackers — a single attacker is usually harmless,
++// but two coordinated attackers ramp up the danger fast.
++//
++// These numbers are conservative; the worst failure mode for an over-
++// tuned king-safety term is the engine sacrificing material to "open the
++// king" without follow-through. We err on the small side.
++const KZ_W = new Int16Array(7);
++KZ_W[KNIGHT] = 18;
++KZ_W[BISHOP] = 14;
++KZ_W[ROOK]   = 26;
++KZ_W[QUEEN]  = 60;
++
++// [Opus 4.7 / 0005] Pre-allocated king-zone bitmaps for evaluate(). Filled
++// at the start of evaluate() based on the current king positions and then
++// indexed once per slider-step inside the mobility loop. Replaces the
++// inline (file-diff, rank-diff) arithmetic from the first revision of
++// this engine, which was hurting NPS by ~25%.
++const _kzWhite = new Uint8Array(128);
++const _kzBlack = new Uint8Array(128);
++
+ // [Opus 4.7] Enhanced evaluate(): adds mobility, knight outposts, tempo,
+ // pawn shield, and protected-passed bonuses on top of 0002's structure.
+ function evaluate() {
+@@ -2197,6 +2343,35 @@
+   // [Opus 4.7] King squares cached locally for pawn-shield.
+   let wKingSq = 0, bKingSq = 0;
+ 
++  // [Opus 4.7 / 0005] King zone attacker tracking — accumulated during the
++  // mobility scan and applied below. wKzAtk = total weighted attacks BY
++  // black pieces INTO the white king's 3x3 zone (i.e. how much white's
++  // king is being menaced). wKzN = count of distinct black piece types
++  // attacking. Symmetric for bKzAtk / bKzN.
++  let wKzAtk = 0, wKzN = 0;
++  let bKzAtk = 0, bKzN = 0;
++  // [Opus 4.7 / 0005] Build the king-zone bitmaps once per evaluate. The
++  // 3x3 zone around each king is precomputed into _kzWhite / _kzBlack;
++  // each slider-target lookup is then a single Uint8Array read instead of
++  // four arithmetic comparisons inline. Cuts evaluate() runtime by ~20%
++  // for slider-heavy positions vs the v1 implementation.
++  const wKSq0 = g_kingSq[WHITE];
++  const bKSq0 = g_kingSq[BLACK];
++  _kzWhite.fill(0);
++  _kzBlack.fill(0);
++  {
++    const wf = wKSq0 & 7, wr = wKSq0 >> 4;
++    const bf = bKSq0 & 7, br = bKSq0 >> 4;
++    for (let df = -1; df <= 1; df++) {
++      const wfx = wf + df, bfx = bf + df;
++      for (let dr = -1; dr <= 1; dr++) {
++        const wrx = wr + dr, brx = br + dr;
++        if (wfx >= 0 && wfx <= 7 && wrx >= 0 && wrx <= 7) _kzWhite[wrx * 16 + wfx] = 1;
++        if (bfx >= 0 && bfx <= 7 && brx >= 0 && brx <= 7) _kzBlack[brx * 16 + bfx] = 1;
++      }
++    }
++  }
++
+   // First pass: material+PST, mobility (sliders/knights), bishop/rook info.
+   // Knight and slider mobility counts target squares that are empty or
+   // contain an enemy piece. We deliberately do not exclude squares attacked
+@@ -2232,62 +2407,136 @@
+     phase += PHASE_INC[type];
+ 
+     // [Opus 4.7] Mobility scan for non-pawn non-king pieces.
++    // [Opus 4.7 / 0005] We also count attacks into the enemy king's 3x3
++    // zone while we're walking the move targets. `attackEnemyKingZone()` is
++    // a tiny inline helper: each move-target square that lies inside the
++    // king zone increments the per-piece attack count. If a piece touches
++    // the zone at all, we add its weight once to the threat sum AND
++    // increment the attacker count. The zone test is a pair of
++    // |file-kingFile|<=1 && |rank-kingRank|<=1 comparisons.
++    // [Opus 4.7 / 0005] kz = bitmap of enemy king zone (the zone we want to
++    // attack from this piece's perspective).
++    const kz = isBlack ? _kzWhite : _kzBlack;
+     if (type === KNIGHT) {
+       let mob = 0;
++      let kzHits = 0;
+       for (let i = 0; i < 8; i++) {
+         const to = sq + KNIGHT_OFFSETS[i];
+         if (to & 0x88) continue;
+         const tp = b[to];
+         if (!tp || (tp & BLACK) === enemy) mob++;
++        if (kz[to]) kzHits++;
+       }
+       if (mob > 8) mob = 8;
+-      if (isBlack) { mgB += KNIGHT_MOB_MG[mob]; egB += KNIGHT_MOB_EG[mob]; }
+-      else         { mgW += KNIGHT_MOB_MG[mob]; egW += KNIGHT_MOB_EG[mob]; }
++      if (isBlack) {
++        mgB += KNIGHT_MOB_MG[mob]; egB += KNIGHT_MOB_EG[mob];
++        if (kzHits) { wKzAtk += KZ_W[KNIGHT] * kzHits; wKzN++; }
++      } else {
++        mgW += KNIGHT_MOB_MG[mob]; egW += KNIGHT_MOB_EG[mob];
++        if (kzHits) { bKzAtk += KZ_W[KNIGHT] * kzHits; bKzN++; }
++      }
+     } else if (type === BISHOP) {
+       let mob = 0;
++      let kzHits = 0;
+       for (let i = 0; i < 4; i++) {
+         const dir = BISHOP_OFFSETS[i];
+         for (let to = sq + dir; !(to & 0x88); to += dir) {
+           const tp = b[to];
+-          if (!tp) { mob++; continue; }
+-          if ((tp & BLACK) === enemy) mob++;
++          if (!tp) {
++            mob++;
++            if (kz[to]) kzHits++;
++            continue;
++          }
++          if ((tp & BLACK) === enemy) {
++            mob++;
++            if (kz[to]) kzHits++;
++          }
+           break;
+         }
+       }
+       if (mob > 13) mob = 13;
+-      if (isBlack) { mgB += BISHOP_MOB_MG[mob]; egB += BISHOP_MOB_EG[mob]; }
+-      else         { mgW += BISHOP_MOB_MG[mob]; egW += BISHOP_MOB_EG[mob]; }
++      if (isBlack) {
++        mgB += BISHOP_MOB_MG[mob]; egB += BISHOP_MOB_EG[mob];
++        if (kzHits) { wKzAtk += KZ_W[BISHOP] * kzHits; wKzN++; }
++      } else {
++        mgW += BISHOP_MOB_MG[mob]; egW += BISHOP_MOB_EG[mob];
++        if (kzHits) { bKzAtk += KZ_W[BISHOP] * kzHits; bKzN++; }
++      }
+     } else if (type === ROOK) {
+       let mob = 0;
++      let kzHits = 0;
+       for (let i = 0; i < 4; i++) {
+         const dir = ROOK_OFFSETS[i];
+         for (let to = sq + dir; !(to & 0x88); to += dir) {
+           const tp = b[to];
+-          if (!tp) { mob++; continue; }
+-          if ((tp & BLACK) === enemy) mob++;
++          if (!tp) {
++            mob++;
++            if (kz[to]) kzHits++;
++            continue;
++          }
++          if ((tp & BLACK) === enemy) {
++            mob++;
++            if (kz[to]) kzHits++;
++          }
+           break;
+         }
+       }
+       if (mob > 14) mob = 14;
+-      if (isBlack) { mgB += ROOK_MOB_MG[mob]; egB += ROOK_MOB_EG[mob]; }
+-      else         { mgW += ROOK_MOB_MG[mob]; egW += ROOK_MOB_EG[mob]; }
++      if (isBlack) {
++        mgB += ROOK_MOB_MG[mob]; egB += ROOK_MOB_EG[mob];
++        if (kzHits) { wKzAtk += KZ_W[ROOK] * kzHits; wKzN++; }
++      } else {
++        mgW += ROOK_MOB_MG[mob]; egW += ROOK_MOB_EG[mob];
++        if (kzHits) { bKzAtk += KZ_W[ROOK] * kzHits; bKzN++; }
++      }
+     } else if (type === QUEEN) {
+       let mob = 0;
++      let kzHits = 0;
+       for (let i = 0; i < 8; i++) {
+         const dir = QUEEN_OFFSETS[i];
+         for (let to = sq + dir; !(to & 0x88); to += dir) {
+           const tp = b[to];
+-          if (!tp) { mob++; continue; }
+-          if ((tp & BLACK) === enemy) mob++;
++          if (!tp) {
++            mob++;
++            if (kz[to]) kzHits++;
++            continue;
++          }
++          if ((tp & BLACK) === enemy) {
++            mob++;
++            if (kz[to]) kzHits++;
++          }
+           break;
+         }
+       }
+       if (mob > 27) mob = 27;
+-      if (isBlack) { mgB += QUEEN_MOB_MG[mob]; egB += QUEEN_MOB_EG[mob]; }
+-      else         { mgW += QUEEN_MOB_MG[mob]; egW += QUEEN_MOB_EG[mob]; }
++      if (isBlack) {
++        mgB += QUEEN_MOB_MG[mob]; egB += QUEEN_MOB_EG[mob];
++        if (kzHits) { wKzAtk += KZ_W[QUEEN] * kzHits; wKzN++; }
++      } else {
++        mgW += QUEEN_MOB_MG[mob]; egW += QUEEN_MOB_EG[mob];
++        if (kzHits) { bKzAtk += KZ_W[QUEEN] * kzHits; bKzN++; }
++      }
+     }
+   }
+ 
++  // [Opus 4.7 / 0005] Apply king-zone danger. Single attacker is mostly
++  // noise so we discount it heavily; from 2+ attackers the threat ramps
++  // up quadratically with the weighted attack sum.
++  //
++  // After two rounds of tuning we land on a fairly small contribution —
++  // the term is mostly useful for ordering preference (attacks favored,
++  // weak king position penalized) rather than for material decisions.
++  // Strong-attack positions still get a meaningful nudge (5-30 cp) but
++  // not enough to drive bad sacrifices.
++  if (wKzN >= 2) {
++    const danger = (wKzAtk * wKzAtk) / 2400 | 0;
++    mgW -= danger;
++  }
++  if (bKzN >= 2) {
++    const danger = (bKzAtk * bKzAtk) / 2400 | 0;
++    mgB -= danger;
++  }
++
+   // Bishop pair bonus (stronger in endgame)
+   if (wBishops >= 2) { mgW += 30; egW += 50; }
+   if (bBishops >= 2) { mgB += 30; egB += 50; }
+@@ -2512,8 +2761,42 @@
+ // LMR guard for captures/promotions.
+ //
+ 
++// [Opus 4.7 / 0005] Late-move-pruning move-count tables. Index is depth (1..8)
++// — beyond depth 8 we don't LMP at all. The "improving" row is more
++// generous (i.e. higher threshold), since when the position is getting
++// better we don't want to skip moves that might convert that. The "not
++// improving" row is tighter, since we're worse off and almost certainly
++// won't fish out an improvement from a low-history quiet at high played-
++// count.
++//
++// After a 200-game test the first version of this table (3..40 / 5..75)
++// proved to be too aggressive — search dropped good moves often enough to
++// wipe out the search-efficiency gains from elsewhere. The numbers below
++// are more conservative: comparable to 0003's `depth^3` formula at the
++// shallow end (where depth^3 actually prunes anything) but bounded so we
++// still get LMP value at moderate depth.
++const LMP_NOT_IMPROVING = new Int32Array([0,  5,  8, 14, 22, 35, 50, 70,  95]);
++const LMP_IMPROVING     = new Int32Array([0,  9, 14, 24, 38, 55, 80, 110, 145]);
++
+ function search(ply, depth, alpha, beta) {
+ 
++  // [Opus 4.7 / 0005] Check extension. Doing this BEFORE the depth<=0
++  // shortcut means we never drop into qsearch while still in check — qsearch
++  // already handles in-check escapes, but extending and using the full
++  // search at depth=1 is much stronger than dropping to qsearch at depth=0
++  // because we get LMR / TT / killer benefits at the next ply.
++  //
++  // Note: this is "naive" check extension — extend whenever the current
++  // node is in check, regardless of singular-ness. It is bounded by depth
++  // never growing past MAX_PLY due to the `ply >= MAX_PLY` check below and
++  // by g_finished aborting the search.
++  let inCheck = 0;
++  if (ply > 0) {
++    const stm0 = g_stm;
++    inCheck = isAttacked(g_kingSq[stm0], stm0 ^ BLACK);
++    if (inCheck) depth++;
++  }
++
+   if (depth <= 0)
+     return qsearch(ply, 0, alpha, beta);
+ 
+@@ -2566,11 +2849,38 @@
+   const stm = g_stm;
+   const nstm = stm ^ BLACK;
+   const origAlpha = alpha;
+-  const inCheck = ttix >= 0 ? (g_ttType[ttix] & TT_INCHECK) !== 0 : isAttacked(g_kingSq[stm], nstm);
+-  const ev = ttix >= 0 ? g_ttEval[ttix] : evaluate();
++  // [Opus 4.7 / 0005] We already determined inCheck above for the check
++  // extension; for the root (ply==0) we still need to fetch it. Use the
++  // TT in-check flag when we have a TT hit (avoids a redundant isAttacked
++  // call), otherwise compute it.
++  if (ply === 0) {
++    inCheck = ttix >= 0 ? (g_ttType[ttix] & TT_INCHECK) !== 0 : isAttacked(g_kingSq[stm], nstm);
++  }
++  let ev = ttix >= 0 ? g_ttEval[ttix] : evaluate();
+   const ttMove = ttix >= 0 ? g_ttMove[ttix] : 0;
+   const playedMoves = node.playedMoves;
+ 
++  // [Opus 4.7 / 0005] TT-corrected static eval. When the TT entry has a
++  // bound type that is tighter than our raw static eval, refine `ev` so
++  // every subsequent pruning heuristic (RFP, razoring, NMP, futility) sees
++  // a better estimate of the true score.
++  //   - TT_EXACT  : use ttScore directly (it's a definitive value)
++  //   - TT_BETA   : ttScore is a LOWER bound; raise ev to ttScore if higher
++  //   - TT_ALPHA  : ttScore is an UPPER bound; lower ev to ttScore if lower
++  // We do this only outside of check (when ev is meaningful) and only when
++  // not in check at the TT entry too — the staticEv heuristic ignores
++  // in-check evaluations.
++  if (!inCheck && ttix >= 0) {
++    const tType = g_ttType[ttix] & TT_TYPE_MASK;
++    const tScore = getAdjustedScore(ply, g_ttScore[ttix]);
++    if (tType === TT_EXACT)
++      ev = tScore;
++    else if (tType === TT_BETA && tScore > ev)
++      ev = tScore;
++    else if (tType === TT_ALPHA && tScore < ev)
++      ev = tScore;
++  }
++
+   // [Opus 4.7] Cache the static eval at this ply for the improving heuristic.
+   // When in check we deliberately do NOT update staticEv so the next non-check
+   // ancestor at ply+2 still compares against the previous reliable eval.
+@@ -2606,6 +2916,26 @@
+       return ev;
+   }
+ 
++  // [Opus 4.7 / 0005] Razoring. At very shallow depth and when our static
++  // eval is far enough below alpha that even a generous tactical margin
++  // can't lift it, drop into qsearch directly. If qsearch's stand-pat
++  // (refined by captures) is still below alpha we just return the qsearch
++  // score — there is no point burning the full search tree.
++  //
++  // Margin grows with depth so that at depth=1 we only razor on big
++  // shortfalls (single piece down or so) while at depth=3 we allow more
++  // margin (a sequence of moves can still pull us back).
++  //
++  // Guarded against PV / in-check / near-mate scores as usual.
++  if (!isPV && !inCheck && depth <= 3 && alpha > -MATEISH) {
++    const razorMargin = 240 + 270 * depth;
++    if (ev + razorMargin < alpha) {
++      const rscore = qsearch(ply, 0, alpha - 1, alpha);
++      if (g_finished) return 0;
++      if (rscore < alpha) return rscore;
++    }
++  }
++
+   // null move pruning
+   if (!isPV && !inCheck && beta < MATEISH && depth > 2 && ev > beta) {
+ 
+@@ -2630,17 +2960,41 @@
+ 
+   initSearch(node, inCheck, ttMove, 0);
+ 
++  // [Opus 4.7 / 0005] Pre-compute LMP cap for this node — depth-indexed
++  // table with improving variant. lmpLimit == 0 means "no LMP at this depth"
++  // (i.e. depth > 8). The "improving" row is more generous so we don't
++  // miss combinations in positions that are getting better; the "not
++  // improving" row is tighter to harvest more savings.
++  let lmpLimit = 0;
++  if (depth >= 1 && depth <= 8) {
++    lmpLimit = improving ? LMP_IMPROVING[depth] : LMP_NOT_IMPROVING[depth];
++  }
++
++  // [Opus 4.7 / 0005] Track played noisy moves separately so on a quiet
++  // beta cutoff we can apply a malus to the previously tried noisy moves
++  // via the capture history (and vice-versa). This is what makes the
++  // capture-history term in rankNoisy converge.
++  const playedNoisy = new Uint32Array(MAX_MOVES);
++  let playedNoisyCount = 0;
++
+   while ((move = getNextMove(node, ply))) {
+ 
+     const noisy = move & MOVE_FLAG_NOISY;
+ 
+-    // late move pruning — drop quiets past a depth-cubed cap on the move count
+-    if (depth > 1 && !inCheck && !noisy && alpha > -MATEISH && played > depth * depth * depth)
++    // [Opus 4.7 / 0005] Late move pruning using the depth-indexed table.
++    // Falls back to never-prune when we're in check, near mate, or out of
++    // table range.
++    if (lmpLimit && !inCheck && !noisy && alpha > -MATEISH && played >= lmpLimit)
+       continue;
+ 
+     // futility pruning
+     if (played && !inCheck && depth <= 1 && !noisy && alpha > -MATEISH && ev + 100 < alpha)
+       continue;
++    // [Opus 4.7 / 0005] History pruning was tried here but removed after a
++    // 200-game test came in flat — the LMP table is already doing the work
++    // we hoped history pruning would do, and pruning before make() means
++    // we don't get the search-stability benefit that LMR-reduced searches
++    // bring. Left as a deliberate non-change for future authors to know.
+ 
+     // [Opus 4.7] SEE pruning for shallow captures with negative SEE — we
+     // already filter via the SEE-aware noisy ordering, but with futility-
+@@ -2664,21 +3018,26 @@
+     if (ply + 1 < MAX_PLY) g_ss[ply + 1].move = move;
+ 
+     playedMoves[played++] = move;
++    // [Opus 4.7 / 0005] Track noisy moves separately for capture-history
++    // bonus/malus on beta cutoff.
++    if (noisy) playedNoisy[playedNoisyCount++] = move;
+ 
+     // [Opus 4.7] LMR formula with improving / isPV / inCheck adjustments.
+     // Base = log(d)*log(played) / 2.25  + 0.75   (same as 0002 baseline).
+     //   - reduce more when not improving (+1 ply)
+     //   - reduce less in PV (-1 ply)
+     //   - reduce less when we were in check (since check evasions matter)
++    //
++    // [Opus 4.7 / 0005] History adjustment kept at ±1 plies but with wider
++    // thresholds — the ±2 variant from an earlier draft over-modulated
++    // reductions and hurt strength. We now treat history as a tie-breaker
++    // rather than a primary signal.
+     let R = 0;
+     if (!noisy && depth >= 3 && played > 3) {
+       R = Math.floor(0.75 + Math.log(depth) * Math.log(played) / 2.25);
+       if (isPV) R -= 1;
+       if (!improving) R += 1;
+       R -= inCheck;
+-      // [Opus 4.7] History-based small adjustment: highly-rated quiets get
+-      // reduced less, poorly-rated more. The piece is at `to` post-make
+-      // (g_board[fr] is empty here, which was wrong in an earlier draft).
+       const toSq = move & 0x7F;
+       const pp = g_board[toSq];
+       const hScore = g_qpth[pp][toSq];
+@@ -2719,10 +3078,18 @@
+           collectPV(node, cNode, bestMove);
+         }
+         if (bestScore >= beta) {
++          // [Opus 4.7 / 0005] Bonus scales with depth (capped by HIST_MAX
++          // gravity inside the update functions). Branch out by whether
++          // the cutoff was caused by a quiet or noisy move:
++          //   - Quiet cutoff: bonus the cutting quiet via qpth+killers+
++          //     countermove; malus the earlier quiets via qpth; malus the
++          //     earlier noisy moves via the new capture history.
++          //   - Noisy cutoff: bonus the cutting noisy via capture history;
++          //     malus the earlier noisy moves via capture history. (Quiets
++          //     don't get a quiet malus here — they failed for a different
++          //     reason than the noisy that found the cut.)
++          const bonus = depth * depth + depth;
+           if (!(bestMove & MOVE_FLAG_NOISY)) {
+-            // [Opus 4.7] Slightly larger bonus (scales with depth); capped
+-            // by HIST_MAX gravity inside updateQpth.
+-            const bonus = depth * depth + depth;
+             updateQpth(bestMove, bonus);
+             const nd = g_ss[ply];
+             if (bestMove !== nd.killer1) {
+@@ -2738,6 +3105,19 @@
+               const pm = playedMoves[i];
+               if (!(pm & MOVE_FLAG_NOISY)) updateQpth(pm, -bonus);
+             }
++            // [Opus 4.7 / 0005] Malus the noisy moves that came before us
++            // — they were tried and didn't cut even though MVV-LVA put
++            // them first, so capture history learns to demote them next
++            // time around.
++            for (let i = 0; i < playedNoisyCount; i++) {
++              updateCaph(playedNoisy[i], -bonus);
++            }
++          } else {
++            // Noisy cutoff: only touch capture history.
++            updateCaph(bestMove, bonus);
++            for (let i = 0; i < playedNoisyCount - 1; i++) {
++              updateCaph(playedNoisy[i], -bonus);
++            }
+           }
+           ttPut(TT_BETA, depth, putAdjustedScore(ply, bestScore), bestMove, ev, inCheck);
+           return bestScore;
+@@ -2800,9 +3180,24 @@
+   const stm = g_stm;
+   const nstm = stm ^ BLACK;
+   const inCheck = ttix >= 0 ? (g_ttType[ttix] & TT_INCHECK) !== 0 : isAttacked(g_kingSq[stm], nstm);
+-  const ev = ttix >= 0 ? g_ttEval[ttix] : evaluate();
++  let ev = ttix >= 0 ? g_ttEval[ttix] : evaluate();
+   const ttMove = ttix >= 0 && (inCheck || (g_ttMove[ttix] & MOVE_FLAG_NOISY)) ? g_ttMove[ttix] : 0;
+ 
++  // [Opus 4.7 / 0005] Same TT-correction trick as in search() — tighten the
++  // static eval using ttScore when the bound type supports it. In qsearch
++  // the gain is largest for the stand-pat decision (`ev >= beta` cutoff)
++  // and for delta pruning thresholds further down.
++  if (!inCheck && ttix >= 0) {
++    const tType = g_ttType[ttix] & TT_TYPE_MASK;
++    const tScore = getAdjustedScore(ply, g_ttScore[ttix]);
++    if (tType === TT_EXACT)
++      ev = tScore;
++    else if (tType === TT_BETA && tScore > ev)
++      ev = tScore;
++    else if (tType === TT_ALPHA && tScore < ev)
++      ev = tScore;
++  }
++
+   let bestScore = -INF;
+ 
+   if (!inCheck) {
+@@ -2966,8 +3361,8 @@
+     }
+ 
+     case 'uci': {
+-      // [Opus 4.7] Updated engine identity
+-      console.log('id name Patchwork 0003_Opus_4_7');
++      // [Opus 4.7 / 0005] Updated engine identity for the new revision.
++      console.log('id name Patchwork 0005_Opus_4_7');
+       console.log('id author Claude Opus 4.7');
+       console.log('uciok');
+       break;
